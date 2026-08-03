@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>FoxiGrow Auto-Claimer</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <!-- Login View -->
+  <div id="loginView" class="view active" style="padding: 20px; text-align: center;">
+    <div style="font-size: 30px; margin-bottom: 10px;">🦊</div>
+    <h2 style="color: white; margin-bottom: 5px;">FoxiGrow</h2>
+    <p style="color: #aaa; font-size: 12px; margin-bottom: 20px;">Enter your license key to continue</p>
+    <input type="text" id="licenseInput" placeholder="License Key (e.g. FOX-...)" style="width: 100%; padding: 10px; border-radius: 4px; border: none; background: rgba(255,255,255,0.1); color: white; margin-bottom: 15px;">
+    <button id="loginBtn" style="width: 100%; padding: 10px; background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; font-weight: bold;">Verify Key</button>
+    <div id="loginError" style="color: #ff5555; margin-top: 10px; font-size: 12px; display: none;">Invalid or expired key.</div>
+  </div>
+
+
+  <!-- Dashboard View -->
+  <div id="dashboardView" class="view">
+    <div class="container">
+      <!-- Header -->
+      <div class="header">
+        <img src="icons/icon48.png" class="logo" alt="logo">
+        <h1>FoxiGrow</h1>
+        <span class="version">v1.6.0</span>
+        <button id="settingsBtn" class="icon-btn header-btn" title="Settings">⚙️</button>
+        <button id="disableBtn" class="icon-btn header-btn power-btn" title="Disable & Close Tabs">⏻</button>
+      </div>
+
+      <!-- Toggle (Start/Pause) -->
+      <div class="toggle-section">
+        <button id="playPauseBtn" class="toggle-btn off">
+          <span class="toggle-icon">▶</span>
+          <span class="toggle-text">START BOT</span>
+        </button>
+      </div>
+
+      <!-- Status -->
+      <div class="status-section">
+        <div class="status-label">Status</div>
+        <div id="statusText" class="status-text">Waiting...</div>
+      </div>
+
+      <!-- Stats -->
+      <div class="stats-section">
+        <div class="stat">
+          <span class="stat-value" id="tasksStarted">0</span>
+          <span class="stat-label">Started</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="tasksFailed">0</span>
+          <span class="stat-label">Failed</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="sessionTime" style="color: #ff9800;">0m</span>
+          <span class="stat-label">SESSION</span>
+        </div>
+        <div class="stat">
+          <span class="stat-value" id="statUsdt" style="color: #4caf50;">0.00</span>
+          <span class="stat-label">USDT</span>
+        </div>
+        </div>
+      </div>
+
+      <!-- Activity Log -->
+      <div class="log-section">
+        <div class="log-header">Activity Log</div>
+        <div id="logContainer" class="log-container">
+          <div class="log-empty">No activity yet</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings View -->
+  <div id="settingsView" class="view hidden">
+    <div class="settings-header">
+      <button id="backBtn" class="icon-btn back-btn">◀ Back</button>
+      <span class="settings-title">Settings</span>
+      <div style="width: 40px;"></div> <!-- Spacer for flex alignment -->
+    </div>
+    
+    <div class="settings-content">
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Blocked Keywords</label>
+          <button class="inline-edit-btn" data-target="blockedKeywordsInput">Edit</button>
+        </div>
+        <textarea id="blockedKeywordsInput" placeholder="e.g. reddit, tiktok" readonly></textarea>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Blocked Task IDs</label>
+          <button class="inline-edit-btn" data-target="blockedTaskIdsInput">Edit</button>
+        </div>
+        <input type="text" id="blockedTaskIdsInput" placeholder="e.g. 19284, 19285" readonly>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Telegram Bot Token</label>
+          <button class="inline-edit-btn" data-target="tgBotTokenInput">Edit</button>
+        </div>
+        <input type="password" id="tgBotTokenInput" placeholder="123456789:AAH..." readonly>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Telegram Chat ID</label>
+          <button class="inline-edit-btn" data-target="tgChatIdInput">Edit</button>
+        </div>
+        <input type="text" id="tgChatIdInput" placeholder="1234567890" readonly>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Radar Server URL (WebSocket)</label>
+          <button class="inline-edit-btn" data-target="radarServerUrlInput">Edit</button>
+        </div>
+        <input type="text" id="radarServerUrlInput" placeholder="ws://localhost:3000" readonly>
+      </div>
+
+      <div class="setting-toggles">
+        <label class="toggle-switch">
+          <input type="checkbox" id="competitiveModeToggle">
+          <span class="slider"></span>
+          Competitive Mode (Fast)
+        </label>
+
+        <label class="toggle-switch">
+          <input type="checkbox" id="chromeNotifToggle" checked>
+          <span class="slider"></span>
+          Chrome Notifications
+        </label>
+
+        <label class="toggle-switch">
+          <input type="checkbox" id="tgNotifToggle">
+          <span class="slider"></span>
+          Telegram Notifications
+        </label>
+        
+        <label class="toggle-switch">
+          <input type="checkbox" id="diagnosticModeToggle">
+          <span class="slider"></span>
+          Diagnostic Profiler
+        </label>
+
+        <button id="exportDiagnosticsBtn" class="btn primary-btn" style="margin-top: 15px; width: 100%;">📥 Export Diagnostics</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="firebase.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
