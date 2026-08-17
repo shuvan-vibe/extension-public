@@ -8,7 +8,9 @@
 </head>
 <body>
   <!-- Login View -->
-  <div id="loginView" class="view active" style="padding: 20px; text-align: center;">
+  <!-- Both views start hidden/inactive except the dashboard, which is the default
+       so the popup does not flash the login page while auth is resolved. -->
+  <div id="loginView" class="view" style="padding: 20px; text-align: center;">
     <div style="font-size: 30px; margin-bottom: 10px;">🦊</div>
     <h2 style="color: white; margin-bottom: 5px;">FoxiGrow</h2>
     <p style="color: #aaa; font-size: 12px; margin-bottom: 20px;">Enter your license key to continue</p>
@@ -19,7 +21,7 @@
 
 
   <!-- Dashboard View -->
-  <div id="dashboardView" class="view">
+  <div id="dashboardView" class="view active">
     <div class="container">
       <!-- Header -->
       <div class="header">

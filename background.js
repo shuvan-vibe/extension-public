@@ -259,6 +259,8 @@ async function verifyLicenseInBackground() {
           return true;
       }
   }
+  // Invalidate the popup's 24h auth cache so it stops showing the dashboard
+  chrome.storage.local.remove('lastAuthCheck');
   return false;
 }
 
@@ -283,6 +285,9 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       foxigrowTabId = null;
       telegramTabId = null;
       
+      // Send session summary to Telegram and reset the session stats
+      endSession();
+      
       broadcastToContentScripts({ type: 'STATE_CHANGED', isEnabled, isPaused });
     }
     return;
@@ -304,6 +309,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       if (telegramTabId) chrome.tabs.remove(telegramTabId).catch(() => {});
       foxigrowTabId = null;
       telegramTabId = null;
+      endSession();
       broadcastToContentScripts({ type: 'STATE_CHANGED', isEnabled, isPaused });
       return;
     }
@@ -422,7 +428,13 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         isEnabled = true;
         isPaused = false;
         chrome.storage.local.set({ isEnabled, isPaused });
+        // Fresh session: reset counters and start the clock
+        stats.tasksStarted = 0;
+        stats.tasksFailed = 0;
+        stats.usdtEarned = 0;
+        stats.activityLog = [];
         stats.sessionStart = Date.now();
+        chrome.storage.local.set({ stats });
         addToLog('▶️ Extension enabled (Starting)');
         sendTelegramMessage('🟢 *FoxiGrow Bot Started!*\nScanning for tasks...');
         startLaunchFlow();
@@ -462,6 +474,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         telegramTabId = null;
       }
       
+      // Send session summary to Telegram and reset the session stats
+      endSession();
+
       // Notify content scripts just in case
       broadcastToContentScripts({ type: 'STATE_CHANGED', isEnabled, isPaused });
       sendResponse({ isEnabled, isPaused });
@@ -652,6 +667,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ data: output });
       break;
 
+    case 'FETCH_DRIP_SCHEDULE':
+      // Fetch drip schedule from Railway proxy in service worker context
+      // (no CORS issues, invisible to page's CSP and Cloudflare)
+      (async () => {
+        try {
+          const endpoint = `https://polling-production-db64.up.railway.app/drip-schedule/${message.taskId}`;
+          const res = await fetch(endpoint, {
+            method: 'GET',
+            headers: { 'Accept': 'application/json' }
+          });
+          if (!res.ok) {
+            sendResponse(null);
+            return;
+          }
+          const data = await res.json();
+          sendResponse(data);
+        } catch (e) {
+          console.error('[FoxiExt-BG] Drip schedule fetch failed:', e);
+          sendResponse(null);
+        }
+      })();
+      return true; // async response
+
     case 'PING':
       // Heartbeat to keep service worker alive
       sendResponse({ pong: true });
@@ -791,6 +829,40 @@ function sendTelegramMessage(text) {
         });
     }
   });
+}
+
+/** Format the current session stats into a Telegram summary message */
+function buildSessionSummary() {
+  let durationText = 'N/A';
+  if (stats.sessionStart) {
+    const elapsed = Math.max(0, Date.now() - stats.sessionStart);
+    const totalMinutes = Math.floor(elapsed / 60000);
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    durationText = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
+  }
+
+  return `📊 *FoxiGrow Session Summary*\n\n` +
+    `⏱ *Duration:* ${durationText}\n` +
+    `✅ *Tasks Started:* ${stats.tasksStarted || 0}\n` +
+    `❌ *Tasks Failed:* ${stats.tasksFailed || 0}\n` +
+    `💰 *USDT Earned:* ${(stats.usdtEarned || 0).toFixed(2)}\n\n` +
+    `Bot has been stopped.`;
+}
+
+/**
+ * Send the session summary to Telegram (if configured) and reset the session stats.
+ * Called whenever the bot fully stops (manual stop or license expiry) — never on pause.
+ */
+function endSession() {
+  sendTelegramMessage(buildSessionSummary());
+
+  stats.tasksStarted = 0;
+  stats.tasksFailed = 0;
+  stats.usdtEarned = 0;
+  stats.sessionStart = null;
+  stats.activityLog = [];
+  chrome.storage.local.set({ stats });
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────

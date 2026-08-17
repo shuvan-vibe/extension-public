@@ -66,9 +66,11 @@ function switchView(viewElement) {
 }
 
 // ─── Auth Logic ──────────────────────────────────────────────────────────────
+const AUTH_CACHE_MS = 24 * 60 * 60 * 1000; // 24 hours
+
 async function verifyAuth() {
     return new Promise((resolve) => {
-        chrome.storage.local.get(['deviceId', 'licenseKey'], async (data) => {
+        chrome.storage.local.get(['deviceId', 'licenseKey', 'lastAuthCheck'], async (data) => {
             if (!data.deviceId) {
                 deviceId = generateUUID();
                 chrome.storage.local.set({ deviceId });
@@ -78,6 +80,12 @@ async function verifyAuth() {
             
             if (data.licenseKey) {
                 currentLicense = data.licenseKey;
+
+                // Use cached verification result for 24h to avoid the Firebase round-trip
+                // (the background license-check alarm still enforces expiry every 30 min)
+                if (data.lastAuthCheck && (Date.now() - data.lastAuthCheck) < AUTH_CACHE_MS) {
+                    return resolve(true);
+                }
                 
                 const license = await globalThis.FirebaseApi.getLicense(currentLicense);
                 if (license && license.active && license.expiresAt > Date.now()) {
@@ -85,9 +93,12 @@ async function verifyAuth() {
                         if (!license.deviceId) {
                             await globalThis.FirebaseApi.activateLicense(currentLicense, deviceId);
                         }
+                        chrome.storage.local.set({ lastAuthCheck: Date.now() });
                         return resolve(true);
                     }
                 }
+                // Verification failed — drop the stale cache
+                chrome.storage.local.remove('lastAuthCheck');
             }
             resolve(false);
         });

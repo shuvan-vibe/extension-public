@@ -86,9 +86,88 @@ function humanDelay(median, spread = 0.25) {
   return Math.max(50, median * Math.exp(spread * normal));
 }
 
-/** Sleep for a given number of milliseconds */
+// ─── Unthrottled Timing Engine (Web Worker) ─────────────────────────────────
+// Chrome throttles setTimeout to 1s minimum and kills rAF in background tabs.
+// A dedicated Web Worker is NEVER throttled — it runs at full speed even when
+// the user switches to another tab or app.
+
+const _workerCode = `
+  const _intervals = {};
+  self.onmessage = function(e) {
+    const d = e.data;
+    if (d.cmd === 'sleep') {
+      setTimeout(() => self.postMessage({ id: d.id }), d.ms);
+    } else if (d.cmd === 'interval') {
+      _intervals[d.id] = setInterval(() => self.postMessage({ id: d.id, tick: true }), d.ms);
+    } else if (d.cmd === 'clearInterval') {
+      clearInterval(_intervals[d.id]);
+      delete _intervals[d.id];
+    }
+  };
+`;
+
+let _timingWorker = null;
+const _workerCallbacks = new Map();
+let _workerIdCounter = 0;
+
+try {
+  const blob = new Blob([_workerCode], { type: 'application/javascript' });
+  _timingWorker = new Worker(URL.createObjectURL(blob));
+  _timingWorker.onmessage = (e) => {
+    const cb = _workerCallbacks.get(e.data.id);
+    if (cb) {
+      if (!e.data.tick) _workerCallbacks.delete(e.data.id); // one-shot: clean up
+      cb();
+    }
+  };
+  console.log('[FoxiExt] ⚡ Timing Worker created — background tab throttling BYPASSED');
+} catch (e) {
+  console.warn('[FoxiExt] Worker creation failed, falling back to throttled setTimeout:', e);
+}
+
+/** Sleep for ms (UNTHROTTLED — works at full speed in background tabs) */
 function sleep(ms) {
+  if (_timingWorker && ms > 0) {
+    return new Promise(resolve => {
+      const id = ++_workerIdCounter;
+      _workerCallbacks.set(id, resolve);
+      _timingWorker.postMessage({ cmd: 'sleep', ms, id });
+    });
+  }
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/** Unthrottled setTimeout replacement */
+function workerTimeout(fn, ms) {
+  if (_timingWorker && ms > 0) {
+    const id = ++_workerIdCounter;
+    _workerCallbacks.set(id, fn);
+    _timingWorker.postMessage({ cmd: 'sleep', ms, id });
+    return id;
+  }
+  return setTimeout(fn, ms);
+}
+
+/** Unthrottled setInterval replacement — returns interval id for cancellation */
+function workerInterval(fn, ms) {
+  if (_timingWorker) {
+    const id = ++_workerIdCounter;
+    _workerCallbacks.set(id, fn);
+    _timingWorker.postMessage({ cmd: 'interval', ms, id });
+    return { _workerId: id };
+  }
+  return { _nativeId: setInterval(fn, ms) };
+}
+
+/** Clear a Worker interval */
+function clearWorkerInterval(handle) {
+  if (!handle) return;
+  if (handle._workerId) {
+    _workerCallbacks.delete(handle._workerId);
+    if (_timingWorker) _timingWorker.postMessage({ cmd: 'clearInterval', id: handle._workerId });
+  } else if (handle._nativeId) {
+    clearInterval(handle._nativeId);
+  }
 }
 
 /** Sleep but check abortFidget frequently */
@@ -229,45 +308,99 @@ async function humanClick(element) {
   
   // Final viewport check (Allow a 50px overflow margin for elements barely clipping the edge)
   const stillOffScreen = y < -50 || y > window.innerHeight + 50 || x < -50 || x > window.innerWidth + 50;
+  const now = new Date();
+  const clickTs = now.toTimeString().split(' ')[0] + '.' + now.getMilliseconds().toString().padStart(3, '0');
+  const elementDesc = `<${element.tagName}> "${element.textContent.trim().substring(0,30)}"`;
+  
   if (stillOffScreen) {
-    console.warn(`[FoxiExt-CLICK] Element STILL off-screen at (${Math.round(x)}, ${Math.round(y)}). Falling back to direct .click()...`);
+    console.warn(`[FoxiExt-CLICK] [${clickTs}] Element off-screen at (${Math.round(x)}, ${Math.round(y)}). Using direct .click()...`);
     try {
       element.click();
-      console.log(`[FoxiExt-CLICK] ⚠️ Used .click() fallback (less stealthy, but better than missing the task)`);
+      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Off-screen .click() SUCCESS on ${elementDesc}`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (off-screen fallback) — ${elementDesc}` });
     } catch (e) {
-      console.error(`[FoxiExt-CLICK] .click() fallback also failed:`, e);
+      console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ Off-screen .click() FAILED on ${elementDesc}:`, e);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ FAILED (off-screen) — ${elementDesc}` });
     }
     return;
   }
   
-  console.log(`[FoxiExt-CLICK] Attempting click on <${element.tagName}> "${element.textContent.trim().substring(0,30)}" at (${Math.round(x)}, ${Math.round(y)}) rect: ${Math.round(rect.left)},${Math.round(rect.top)},${Math.round(rect.width)}x${Math.round(rect.height)} fast=${isFast}`);
-  
-  try {
-    const response = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: isFast });
-    console.log(`[FoxiExt-CLICK] SIMULATE_CLICK response:`, JSON.stringify(response));
-    if (response && response.error) {
-      // Try re-attaching debugger instead of using detectable .click()
-      console.warn(`[FoxiExt-CLICK] Click FAILED: ${response.error}. Trying reattach...`);
-      const reattach = await sendMessage({ type: 'REATTACH_DEBUGGER' });
-      console.log(`[FoxiExt-CLICK] Reattach response:`, JSON.stringify(reattach));
-      if (reattach && reattach.ok) {
-        // Retry the click after reattach
-        await sleep(100);
-        const retry = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: isFast });
-        console.log(`[FoxiExt-CLICK] Retry response:`, JSON.stringify(retry));
-        if (retry && !retry.error) {
-          console.log(`[FoxiExt-CLICK] ✅ Retry succeeded!`);
-          return;
-        }
-      }
-      // Debugger completely failed, and synthetic clicks are highly detectable
-      console.warn(`[FoxiExt-CLICK] Debugger unavailable. Aborting click to remain undetectable.`);
-    } else {
-      console.log(`[FoxiExt-CLICK] ✅ Click sent successfully via debugger`);
+  if (isFast) {
+    // ── COMPETITIVE MODE: Direct click (100% reliable, no debugger dependency) ──
+    console.log(`[FoxiExt-CLICK] [${clickTs}] COMPETITIVE direct click on ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+    
+    try {
+      // Fire a realistic pointer + mouse event chain before .click() for slightly more realism
+      const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+      element.click();
+      
+      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ COMPETITIVE click SUCCESS on ${elementDesc}`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (competitive/direct) — ${elementDesc}` });
+      logDiagnostic('click', `✅ Direct click SUCCESS: ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+    } catch (err) {
+      console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ COMPETITIVE click FAILED on ${elementDesc}:`, err);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ FAILED (competitive) — ${elementDesc} — ${err.message}` });
+      logDiagnostic('click', `❌ Direct click FAILED: ${elementDesc} — ${err.message}`);
     }
-  } catch (err) {
-    console.error(`[FoxiExt-CLICK] Click message THREW:`, err);
-    console.warn(`[FoxiExt-CLICK] Aborting click to remain undetectable.`);
+  } else {
+    // ── NON-COMPETITIVE MODE: Debugger click (stealthy) with .click() fallback ──
+    console.log(`[FoxiExt-CLICK] [${clickTs}] Debugger click on ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+    
+    try {
+      const response = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: false });
+      if (response && response.error) {
+        // Debugger failed — try reattach + retry
+        console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger FAILED: ${response.error}. Trying reattach...`);
+        const reattach = await sendMessage({ type: 'REATTACH_DEBUGGER' });
+        if (reattach && reattach.ok) {
+          await sleep(100);
+          const retry = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: false });
+          if (retry && !retry.error) {
+            console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS (after reattach) on ${elementDesc}`);
+            sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger reattach) — ${elementDesc}` });
+            logDiagnostic('click', `✅ Debugger click SUCCESS (reattach): ${elementDesc}`);
+            return;
+          }
+        }
+        // Debugger completely failed — fall back to direct .click() instead of aborting
+        console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger unavailable. Falling back to direct .click()...`);
+        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        element.click();
+        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
+        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger failed → .click() fallback) — ${elementDesc}` });
+        logDiagnostic('click', `⚠️ Debugger failed, used .click() fallback: ${elementDesc}`);
+      } else {
+        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS on ${elementDesc}`);
+        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger) — ${elementDesc}` });
+        logDiagnostic('click', `✅ Debugger click SUCCESS: ${elementDesc}`);
+      }
+    } catch (err) {
+      // Debugger threw — fall back to direct .click()
+      console.error(`[FoxiExt-CLICK] [${clickTs}] Debugger THREW: ${err.message}. Falling back to .click()...`);
+      try {
+        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+        element.click();
+        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
+        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger threw → .click() fallback) — ${elementDesc}` });
+        logDiagnostic('click', `⚠️ Debugger threw, used .click() fallback: ${elementDesc}`);
+      } catch (fallbackErr) {
+        console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ ALL click methods FAILED on ${elementDesc}:`, fallbackErr);
+        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ALL METHODS FAILED — ${elementDesc}` });
+        logDiagnostic('click', `❌ ALL click methods FAILED: ${elementDesc} — ${fallbackErr.message}`);
+      }
+    }
   }
 }
 
@@ -456,23 +589,31 @@ function preScrollToTasks() {
 
 let rAFScanActive = false;
 let rAFScanEndTime = 0;
+let rAFScanInterval = null;
 
-/** Aggressive 60fps DOM scanner for zero-latency detection */
+/** Aggressive DOM scanner — uses Worker interval (works in background tabs unlike rAF) */
 function startAggressiveRAFScan(durationMs = 5000) {
   rAFScanEndTime = Math.max(rAFScanEndTime, Date.now() + durationMs);
   if (rAFScanActive) return;
   rAFScanActive = true;
   
-  function scan() {
-    if (!rAFScanActive) return;
+  // Use Worker-based interval at ~16ms (60fps equivalent) — never throttled
+  rAFScanInterval = workerInterval(() => {
+    if (!rAFScanActive) {
+      clearWorkerInterval(rAFScanInterval);
+      rAFScanInterval = null;
+      return;
+    }
     
     if (isEnabled && !isPaused && currentState === STATE.SCANNING) {
       const startable = findStartableTasks();
       if (startable.length > 0) {
-        logDiagnostic('system', 'RAF POLL: Task(s) detected in DOM');
-        log('⚡ 60FPS RAF SCAN detected tasks instantly!');
+        logDiagnostic('system', 'WORKER POLL: Task(s) detected in DOM');
+        log('⚡ Worker scan detected tasks instantly!');
         rAFScanActive = false;
         rAFScanEndTime = 0;
+        clearWorkerInterval(rAFScanInterval);
+        rAFScanInterval = null;
         abortFidget = true;
         if (scanTimer) clearTimeout(scanTimer);
         mainLoop();
@@ -482,13 +623,10 @@ function startAggressiveRAFScan(durationMs = 5000) {
     
     if (Date.now() > rAFScanEndTime) {
       rAFScanActive = false;
-      return;
+      clearWorkerInterval(rAFScanInterval);
+      rAFScanInterval = null;
     }
-    
-    requestAnimationFrame(scan);
-  }
-  
-  scan();
+  }, 16);
 }
 
 /** 
@@ -641,32 +779,60 @@ function findGoActionButton() {
   // ── Strategy 1: Text-based matching across ALL elements ──
   const allElements = document.querySelectorAll('button, a, div, span');
   
-  const actionKeywords = ['go ', 'follow', 'like', 'retweet', 'join', 'watch', 'subscribe', 'visit'];
+  // Keywords that MUST be prefixed with "go " to match (too common in task titles otherwise)
+  const goOnlyKeywords = ['follow', 'like', 'retweet', 'join', 'watch', 'subscribe', 'visit'];
+  // Keywords that match standalone
+  const standaloneKeywords = ['go '];
+  
   const ignoreExact = ['submit', 'cancel', 'verify', 'check', 'got it', 'close', 'start', 'claim',
                         'upload screenshot', 'time left', 'copy link', 'tasks', 'leaderboard', 
-                        'available', 'completed', 'task center'];
+                        'available', 'completed', 'task center', 'continue', 'browse other quests'];
   
   const matches = [];
   
   for (const el of allElements) {
     const text = el.textContent.trim().toLowerCase();
-    if (!text || text.length > 40) continue;
+    if (!text || text.length > 25) continue;  // GO buttons are short (e.g. "Go Follow", "Go Visit")
     if (text.includes('[#')) continue;
     if (ignoreExact.includes(text)) continue;
     
-    // Check if text contains any action keyword
-    const hasAction = actionKeywords.some(kw => text.includes(kw));
-    if (!hasAction) continue;
+    // Check if text starts with "go " (strongest signal)
+    const startsWithGo = text.startsWith('go ');
+    
+    // For non-"go" keywords, only match if text is very short AND is a button/a
+    // (prevents matching task title DIVs like "Join a SubredditStart")
+    let isValidMatch = false;
+    if (startsWithGo) {
+      isValidMatch = true;
+    } else {
+      // Only accept button/a tags for standalone keywords, and text must be very short
+      const tag = el.tagName.toLowerCase();
+      if ((tag === 'button' || tag === 'a') && text.length <= 15) {
+        isValidMatch = goOnlyKeywords.some(kw => text.startsWith(kw));
+      }
+    }
+    
+    if (!isValidMatch) continue;
     
     // Skip if it also contains ignore words (prevents matching parent containers)
-    if (text.includes('cancel') || text.includes('upload')) continue;
+    if (text.includes('cancel') || text.includes('upload') || text.includes('start')) continue;
+    
+    // Visual check: element should be visible and in the modal area (not behind it)
+    const elRect = el.getBoundingClientRect();
+    if (elRect.width === 0 || elRect.height === 0) continue; // hidden element
     
     console.log(`[FoxiExt-DIAG] Strategy 1 MATCH: <${el.tagName}> "${text}"`);
     matches.push({ el, text, tag: el.tagName.toLowerCase() });
   }
 
   if (matches.length > 0) {
-    // Prefer <button> or <a> tags
+    // Prefer "go " prefixed matches first
+    const goMatch = matches.find(m => m.text.startsWith('go '));
+    if (goMatch) {
+      log(`GO button found (text match): <${goMatch.tag}> "${goMatch.text}"`);
+      return goMatch.el;
+    }
+    // Then prefer <button> or <a> tags
     const buttonOrLink = matches.find(m => m.tag === 'button' || m.tag === 'a');
     if (buttonOrLink) {
       log(`GO button found (text match): <${buttonOrLink.tag}> "${buttonOrLink.text}"`);
@@ -678,17 +844,49 @@ function findGoActionButton() {
     return matches[0].el;
   }
   
-  // ── Strategy 2: Positional fallback — find all buttons in modal, pick the non-Cancel one ──
+  // ── Strategy 2: Positional fallback — find buttons in the MODAL area only ──
+  // FoxiGrow uses a bottom-sheet modal, so real GO buttons are in the lower portion of the viewport.
+  // We must filter out all task-list and navigation buttons from the background page.
   console.log('[FoxiExt-DIAG] Strategy 1 found NO matches, trying positional fallback...');
+  
+  const ignoreTexts = [
+    'cancel', 'start', 'got it', 'close', 'tasks', 'leaderboard', 'continue',
+    'browse other quests', 'upload screenshot', 'copy', 'copy link', 'verify',
+    // Tab filter buttons
+    'all', 'twitter', 'youtube', 'github', 'website', 'websites', 'tiktok', 'telegram',
+    // Task list UI
+    'link tiktok account', 'task center', 'history', 'available', 'completed',
+  ];
+  
   const modalButtons = Array.from(allBtns).filter(btn => {
     const text = btn.textContent.trim().toLowerCase();
-    // Skip navigation/control buttons
-    if (['cancel', 'start', 'got it', 'close', 'tasks', 'leaderboard'].includes(text)) return false;
-    // Skip the bottom nav bar buttons (they're usually outside the modal)
+    if (!text) return false;
+    
+    // Skip known non-GO buttons
+    if (ignoreTexts.includes(text)) return false;
+    
+    // Skip "Hidden (N)" style buttons (task list expand toggles)
+    if (text.startsWith('hidden')) return false;
+    
+    // Skip buttons with task-list content (prices, stats, IDs)
+    if (text.includes('+') || text.includes('#') || text.includes('$')) return false;
+    
+    // Skip very long text (GO buttons are short)
+    if (text.length > 20) return false;
+    
     const rect = btn.getBoundingClientRect();
     if (rect.width === 0 || rect.height === 0) return false; // hidden
-    if (rect.bottom > window.innerHeight - 60) return false; // bottom nav
+    if (rect.bottom > window.innerHeight - 60) return false; // bottom nav bar
     if (rect.top < 10) return false; // top bar
+    
+    // Must be in the bottom-sheet modal area (lower ~60% of viewport)
+    // Task list buttons are typically in the top portion, modal content is in the bottom sheet
+    const modalAreaTop = window.innerHeight * 0.35;
+    if (rect.top < modalAreaTop) {
+      console.log(`[FoxiExt-DIAG] Strategy 2 SKIPPED (above modal area): "${btn.textContent.trim()}" top=${Math.round(rect.top)}`);
+      return false;
+    }
+    
     console.log(`[FoxiExt-DIAG] Strategy 2 candidate: "${btn.textContent.trim()}" top=${Math.round(rect.top)}`);
     return true;
   });
@@ -792,22 +990,65 @@ function isTaskStarted() {
   if (copyBtn) return true;
 
   // Method 4: Check if the task's button changed to "CONTINUE" in the main list
-  // (This happens if FoxiGrow auto-closes the modal after starting)
-  const continueBtn = findElementByText('button', 'continue');
-  if (continueBtn) return true;
+  // BUT only if the modal has actually closed (no Cancel button visible).
+  // Without this guard, CONTINUE buttons from OTHER already-started tasks cause false positives.
+  const cancelBtn = findElementByText('button', 'cancel');
+  if (!cancelBtn) {
+    // Modal appears to be closed — safe to check the list
+    const continueBtn = findElementByText('button', 'continue');
+    if (continueBtn) return true;
+  }
 
   return false;
 }
 
 /** Dismiss the task view / modal by clicking the backdrop or back buttons */
 function dismissModal() {
-  // Strategy 1: Blind physical click on the absolute top-center (y=15) of the screen
-  // Because FoxiGrow uses a "Bottom Sheet" design, the top 50px of the screen is the dark backdrop.
-  // We fire a direct hardware click exactly at (x: center, y: 15) to hit the dark backdrop perfectly.
-  log('Strategy 1: Firing direct hardware click at top of screen to hit backdrop');
+  const isFast = userSettings.competitiveMode || false;
   const clickX = Math.round(window.innerWidth / 2);
   const clickY = 15;
-  sendMessage({ type: 'SIMULATE_CLICK', x: clickX, y: clickY }).catch(() => {});
+  
+  // ── Strategy 1: Find and click the backdrop element via DOM ──
+  // FoxiGrow uses a "Bottom Sheet" design — the dark area at the top is a clickable backdrop overlay.
+  // Use elementFromPoint to find whatever DOM element is at (center, 15) and click it directly.
+  const backdropEl = document.elementFromPoint(clickX, clickY);
+  if (backdropEl) {
+    log(`Strategy 1: Clicking backdrop element <${backdropEl.tagName}> at (${clickX}, ${clickY})`);
+    try {
+      const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: clickX, clientY: clickY };
+      backdropEl.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+      backdropEl.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+      backdropEl.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+      backdropEl.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+      backdropEl.click();
+    } catch (e) {
+      log(`Strategy 1 failed: ${e.message}`);
+    }
+  }
+  
+  // ── Strategy 2: Find and click any close/back/cancel buttons ──
+  const closeKeywords = ['close', 'back', '×', '✕', '✖'];
+  const allBtns = document.querySelectorAll('button, [role="button"], a');
+  for (const btn of allBtns) {
+    const text = btn.textContent.trim().toLowerCase();
+    const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
+    if (closeKeywords.some(kw => text === kw || ariaLabel.includes(kw))) {
+      log(`Strategy 2: Found close button: "${btn.textContent.trim()}"`);
+      btn.click();
+      break;
+    }
+  }
+  
+  // ── Strategy 3: Simulate Escape key press (closes modals in most React apps) ──
+  log('Strategy 3: Dispatching Escape key');
+  document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+  document.dispatchEvent(new KeyboardEvent('keyup', { key: 'Escape', code: 'Escape', keyCode: 27, bubbles: true }));
+  
+  // ── Strategy 4: Debugger click on backdrop (works when debugger is attached) ──
+  if (!isFast) {
+    log('Strategy 4: Debugger click at backdrop');
+    sendMessage({ type: 'SIMULATE_CLICK', x: clickX, y: clickY }).catch(() => {});
+  }
   
   return true;
 }
@@ -815,13 +1056,14 @@ function dismissModal() {
 // ─── Keep-Alive Heartbeat ────────────────────────────────────────────────────
 // Chrome Service Workers sleep after 30s. We send a ping every 20s to keep it 
 // permanently awake, ensuring zero wake-up latency when a task drops.
-setInterval(() => {
+// Uses Worker interval so it's never throttled when tab is hidden.
+workerInterval(() => {
   chrome.runtime.sendMessage({ type: 'PING' }).catch(() => {});
 }, 20000);
 
 // ─── State Machine ───────────────────────────────────────────────────────────
 
-/** Wait for a condition to be true, polling at an interval with a timeout */
+/** Wait for a condition to be true, polling at an interval with a timeout (UNTHROTTLED) */
 function waitForCondition(checkFn, interval, timeout) {
   return new Promise((resolve) => {
     const startTime = Date.now();
@@ -834,67 +1076,62 @@ function waitForCondition(checkFn, interval, timeout) {
         resolve(false);
         return;
       }
-      setTimeout(check, interval);
+      workerTimeout(check, interval);
     };
     check();
   });
 }
 
-/** Fetch exact drip schedule for a task and schedule a precision snipe */
+/** Fetch exact drip schedule for a task and schedule a precision snipe.
+ *  The actual fetch is routed through background.js (service worker) to avoid
+ *  CORS errors and CSP violation reports that could expose the extension. */
 async function fetchDripSchedule(taskId, taskTitle) {
   try {
-    // 🛡️ Route request through the safe Railway Proxy instead of hitting FoxiGrow directly
-    const endpoint = `https://polling-production-db64.up.railway.app/drip-schedule/${taskId}`;
-    
-    const response = await fetch(endpoint, {
-      method: 'GET',
-      headers: { 'Accept': 'application/json' }
+    // Request the drip schedule via background.js (invisible to page context)
+    const data = await new Promise(resolve => {
+      chrome.runtime.sendMessage({ type: 'FETCH_DRIP_SCHEDULE', taskId }, resolve);
     });
     
-    if (!response.ok) return;
+    if (!data || !data.schedule) return;
     
-    const data = await response.json();
+    const schedule = data.schedule;
+    const now = Date.now();
     
-    if (data && data.schedule) {
-      const schedule = data.schedule;
-      const now = Date.now();
+    // Find the first batch that drops in the future
+    let nextDrop = null;
+    for (const batch of schedule) {
+      const releaseMs = batch.releaseAt * 1000;
+      if (releaseMs > now) {
+        nextDrop = releaseMs;
+        break;
+      }
+    }
+    
+    if (nextDrop) {
+      const delayMs = nextDrop - now;
       
-      // Find the first batch that drops in the future
-      let nextDrop = null;
-      for (const batch of schedule) {
-        const releaseMs = batch.releaseAt * 1000;
-        if (releaseMs > now) {
-          nextDrop = releaseMs;
-          break;
+      // If the drop is more than an hour away, ignore it
+      if (delayMs > 3600000) return;
+      
+      log(`🎯 Sniper Scheduled: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s!`);
+      sendMessage({ type: 'ADD_LOG', text: `🎯 Sniper locked on: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s` });
+      
+      // Schedule the snipe (uses Worker timeout so it's not throttled in bg tabs)
+      workerTimeout(() => {
+        log(`🎯 Sniper triggered for ${taskTitle}! Reloading...`);
+        // Clear cooldown instantly so it's startable
+        failedTaskCooldowns.delete(taskId);
+        
+        // Trigger the exact same highly-optimized direct API refresh that Radar uses
+        chrome.runtime.sendMessage({ type: 'TRIGGER_DIRECT_REFRESH' }).catch(() => {});
+        
+        // Restart loop in aggressive mode
+        if (isEnabled && !isPaused) {
+          abortFidget = true;
+          if (scanTimer) clearTimeout(scanTimer);
+          mainLoop();
         }
-      }
-      
-      if (nextDrop) {
-        const delayMs = nextDrop - now;
-        
-        // If the drop is more than an hour away, ignore it
-        if (delayMs > 3600000) return;
-        
-        log(`🎯 Sniper Scheduled: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s!`);
-        sendMessage({ type: 'ADD_LOG', text: `🎯 Sniper locked on: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s` });
-        
-        // Schedule the snipe
-        setTimeout(() => {
-          log(`🎯 Sniper triggered for ${taskTitle}! Reloading...`);
-          // Clear cooldown instantly so it's startable
-          failedTaskCooldowns.delete(taskId);
-          
-          // Trigger the exact same highly-optimized direct API refresh that Radar uses
-          chrome.runtime.sendMessage({ type: 'TRIGGER_DIRECT_REFRESH' }).catch(() => {});
-          
-          // Restart loop in aggressive mode
-          if (isEnabled && !isPaused) {
-            abortFidget = true;
-            if (scanTimer) clearTimeout(scanTimer);
-            mainLoop();
-          }
-        }, delayMs);
-      }
+      }, delayMs);
     }
   } catch (e) {
     log(`Sniper fetch failed for #${taskId}: ${e.message}`);
@@ -912,15 +1149,54 @@ function handleTaskFailure(taskId, errorReason, taskTitle = '') {
       // Hard fail: leave in processedTaskIds so we never retry it
       log(`Task #${taskId} hard-failed: ${errorReason}`);
     } else {
-      // Soft fail (missed slot, lag, etc): remove from processed and put on 10s cooldown
+      // Remove from processed so it can be retried after cooldown
       processedTaskIds.delete(taskId);
-      failedTaskCooldowns.set(taskId, Date.now() + 10000);
-      log(`Task #${taskId} placed on 10s cooldown`);
+      
+      // "Unable to Proceed" / slots full → 60s cooldown (slots don't free up quickly)
+      const isSlotsFullFail = errorReason.includes('Unable to Proceed') || errorReason.includes('No slots') || errorReason.includes('quota');
+      const cooldownMs = isSlotsFullFail ? 60000 : 10000;
+      const cooldownLabel = isSlotsFullFail ? '60s' : '10s';
+      
+      failedTaskCooldowns.set(taskId, Date.now() + cooldownMs);
+      log(`Task #${taskId} placed on ${cooldownLabel} cooldown (${errorReason})`);
       
       // Try to read the exact drip schedule for a precision snipe!
       fetchDripSchedule(taskId, taskTitle);
     }
   }
+}
+
+/** Extract the task URL from the modal content */
+function extractTaskUrl() {
+  try {
+    // Strategy 1: Find the text next to the "Copy" button
+    const elements = document.querySelectorAll('button, div, span');
+    const copyBtn = Array.from(elements).find(el => el.textContent.trim().toLowerCase() === 'copy');
+    if (copyBtn && copyBtn.parentElement) {
+      const text = copyBtn.parentElement.innerText || '';
+      const match = text.match(/https?:\/\/[^\s]+/);
+      if (match) return match[0];
+    }
+    
+    // Strategy 1.5: Direct check for the FoxiGrow link element class
+    const linkEl = document.querySelector('.qm-link-scroll');
+    if (linkEl) {
+      const text = linkEl.textContent.trim();
+      if (text.startsWith('http')) return text;
+    }
+    
+    // Strategy 2: Regex the whole page and grab the last URL (ignores tutorial links)
+    const urls = document.body.innerText.match(/https?:\/\/[^\s]+/g);
+    if (urls) {
+      const filtered = urls.filter(u => !u.toLowerCase().includes('tutorial') && !u.includes('youtube.com/shorts'));
+      if (filtered.length > 0) {
+        return filtered[filtered.length - 1]; // Task link is usually at the bottom
+      }
+    }
+  } catch (e) {
+    console.error('[FoxiExt] Error extracting URL:', e);
+  }
+  return '';
 }
 
 /** The main claim sequence for a single task */
@@ -1026,44 +1302,22 @@ async function claimTask(task) {
   logDiagnostic(taskId, 'Clicking GO button');
   log(`Clicking GO action for task #${taskId}: "${goButton.textContent.trim()}"`);
   
-  // ── Extract Task URL (New UI) ──
+  // ── Extract Task URL (attempt 1: before GO click) ──
   let taskUrl = '';
-  try {
-    // Strategy 1: Find the text next to the "Copy" button
-    const elements = document.querySelectorAll('button, div, span');
-    const copyBtn = Array.from(elements).find(el => el.textContent.trim().toLowerCase() === 'copy');
-    if (copyBtn && copyBtn.parentElement) {
-      const text = copyBtn.parentElement.innerText || '';
-      const match = text.match(/https?:\/\/[^\s]+/);
-      if (match) taskUrl = match[0];
-    }
-    
-    // Strategy 1.5: Direct check for the FoxiGrow link element class
-    if (!taskUrl) {
-      const linkEl = document.querySelector('.qm-link-scroll');
-      if (linkEl) {
-        const text = linkEl.textContent.trim();
-        if (text.startsWith('http')) {
-          taskUrl = text;
-        }
-      }
-    }
-    
-    // Strategy 2: Regex the whole page and grab the last URL (ignores tutorial links)
-    if (!taskUrl) {
-      const urls = document.body.innerText.match(/https?:\/\/[^\s]+/g);
-      if (urls) {
-        const filtered = urls.filter(u => !u.toLowerCase().includes('tutorial') && !u.includes('youtube.com/shorts'));
-        if (filtered.length > 0) {
-          taskUrl = filtered[filtered.length - 1]; // Task link is usually at the bottom
-        }
-      }
-    }
-  } catch (e) {
-    console.error('[FoxiExt] Error extracting URL:', e);
-  }
+  // Small wait to let the modal content (including URL) render
+  await sleep(50);
+  taskUrl = extractTaskUrl();
   
   await humanClick(goButton);
+  
+  // ── Extract Task URL (attempt 2: after GO click, content may have rendered now) ──
+  if (!taskUrl) {
+    await sleep(100); // Give the page a moment to update after click
+    taskUrl = extractTaskUrl();
+    if (taskUrl) {
+      log(`Task URL found on second attempt (after GO click): ${taskUrl}`);
+    }
+  }
 
   // ── Step 4: Check if task started (or if error screen appeared) ──
   currentState = STATE.CHECKING;
@@ -1271,13 +1525,13 @@ async function mainLoop() {
   }
 }
 
-/** Schedule the next scan */
+/** Schedule the next scan (UNTHROTTLED — works in background tabs) */
 function scheduleNextScan() {
   if (scanTimer) clearTimeout(scanTimer);
   // Variable scan interval with occasional longer pauses
   let interval = randomDelay(CONFIG.SCAN_INTERVAL);
   if (Math.random() < 0.1) interval += 5000 + Math.random() * 7000; // 10% chance of 5-12s pause
-  scanTimer = setTimeout(() => {
+  scanTimer = workerTimeout(() => {
     if (isEnabled && !isPaused) mainLoop();
   }, interval);
 }
@@ -1362,7 +1616,7 @@ function setupObserver() {
               const baseWait = userSettings.competitiveMode ? CONFIG.COMPETITIVE_REFLEX_MIN : 200;
               const varWait = userSettings.competitiveMode ? CONFIG.COMPETITIVE_REFLEX_VAR : 300;
               
-              setTimeout(() => {
+              workerTimeout(() => {
                 if (isEnabled && !isPaused) mainLoop();
               }, baseWait + Math.random() * varWait);
               return;
@@ -1474,6 +1728,22 @@ async function init() {
   // Set initial reload times
   nextReloadTime = Date.now() + randomDelay(CONFIG.RELOAD_INTERVAL);
   nextHardReloadTime = Date.now() + randomDelay(CONFIG.HARD_RELOAD_INTERVAL);
+
+  // ── Visibility Change Tracking ──
+  // Log when the tab goes to background so you can see if performance degrades
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+      log('👁️ Tab is now HIDDEN (background) — Worker timing keeps us alive');
+      sendMessage({ type: 'STATUS_UPDATE', status: '👁️ Tab hidden — Worker timing active' });
+    } else {
+      log('👁️ Tab is now VISIBLE (foreground)');
+      sendMessage({ type: 'STATUS_UPDATE', status: '👁️ Tab visible — full speed' });
+      // Immediately re-scan when user comes back (tasks may have appeared while hidden)
+      if (isEnabled && !isPaused && currentState === STATE.SCANNING) {
+        startAggressiveRAFScan(3000);
+      }
+    }
+  });
 
   // Set up MutationObserver regardless of enabled state
   // (it will only trigger actions when enabled)
