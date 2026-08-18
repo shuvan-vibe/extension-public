@@ -70,8 +70,9 @@
           <span class="stat-value" id="statUsdt" style="color: #4caf50;">0.00</span>
           <span class="stat-label">USDT</span>
         </div>
-        </div>
       </div>
+
+      <button id="viewSnipesBtn" class="btn" style="width: 100%; margin-bottom: 15px; display: none;">View Scheduled Refreshes (<span id="snipesCount">0</span>)</button>
 
       <!-- Activity Log -->
       <div class="log-section">
@@ -80,14 +81,21 @@
           <!-- Logs go here -->
         </div>
       </div>
+    </div>
+  </div>
 
-      <!-- Active Scheduled Snipes -->
-      <div class="snipes-section" style="display: none;" id="snipesSection">
-        <div class="log-title">SCHEDULED REFRESHES</div>
-        <div class="snipes-container" id="snipesContainer">
-          <!-- Snipes go here -->
-        </div>
+  <!-- Snipes View -->
+  <div id="snipesView" class="view hidden">
+    <div class="settings-header">
+      <button id="snipesBackBtn" class="icon-btn back-btn">◀ Back</button>
+      <span class="settings-title">Scheduled Refreshes</span>
+      <div style="width: 40px;"></div>
+    </div>
+    <div class="settings-content">
+      <div class="snipes-container" id="snipesContainer" style="max-height: none; background: transparent; padding: 0;">
+        <!-- Snipes go here -->
       </div>
+      <div id="noSnipesMsg" style="text-align: center; color: #888; margin-top: 20px; display: none;">No active schedules.</div>
     </div>
   </div>
 

@@ -26,8 +26,12 @@ const statUsdtEl = document.getElementById('statUsdt');
 const logContainer = document.getElementById('logContainer');
 const radarText = document.getElementById('radarText');
 const radarDot = document.getElementById('radarDot');
-const snipesSection = document.getElementById('snipesSection');
+const viewSnipesBtn = document.getElementById('viewSnipesBtn');
+const snipesCount = document.getElementById('snipesCount');
+const snipesView = document.getElementById('snipesView');
+const snipesBackBtn = document.getElementById('snipesBackBtn');
 const snipesContainer = document.getElementById('snipesContainer');
+const noSnipesMsg = document.getElementById('noSnipesMsg');
 
 // Settings Inputs
 const blockedKeywordsInput = document.getElementById('blockedKeywordsInput');
@@ -178,11 +182,32 @@ async function init() {
 
   // View Navigation
   settingsBtn.addEventListener('click', () => {
-    switchView(settingsView);
+    dashboardView.classList.remove('active');
+    dashboardView.classList.add('hidden');
+    settingsView.classList.remove('hidden');
+    settingsView.classList.add('active');
   });
 
   backBtn.addEventListener('click', () => {
-    switchView(dashboardView);
+    settingsView.classList.remove('active');
+    settingsView.classList.add('hidden');
+    dashboardView.classList.remove('hidden');
+    dashboardView.classList.add('active');
+    saveSettings();
+  });
+
+  viewSnipesBtn.addEventListener('click', () => {
+    dashboardView.classList.remove('active');
+    dashboardView.classList.add('hidden');
+    snipesView.classList.remove('hidden');
+    snipesView.classList.add('active');
+  });
+
+  snipesBackBtn.addEventListener('click', () => {
+    snipesView.classList.remove('active');
+    snipesView.classList.add('hidden');
+    dashboardView.classList.remove('hidden');
+    dashboardView.classList.add('active');
   });
 
   // Action Buttons
@@ -434,12 +459,16 @@ function updateLog(activityLog) {
 
 function updateSnipes(activeSnipes) {
   if (!activeSnipes || activeSnipes.length === 0) {
-    snipesSection.style.display = 'none';
+    viewSnipesBtn.style.display = 'none';
     snipesContainer.innerHTML = '';
+    noSnipesMsg.style.display = 'block';
     return;
   }
 
-  snipesSection.style.display = 'block';
+  viewSnipesBtn.style.display = 'block';
+  snipesCount.textContent = activeSnipes.length;
+  noSnipesMsg.style.display = 'none';
+  
   snipesContainer.innerHTML = activeSnipes.map(snipe => {
     const remainingSecs = Math.max(0, (snipe.releaseAt - Date.now()) / 1000).toFixed(0);
     return `
