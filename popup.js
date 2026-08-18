@@ -459,13 +459,12 @@ function updateLog(activityLog) {
 
 function updateSnipes(activeSnipes) {
   if (!activeSnipes || activeSnipes.length === 0) {
-    viewSnipesBtn.style.display = 'none';
+    snipesCount.textContent = '0';
     snipesContainer.innerHTML = '';
     noSnipesMsg.style.display = 'block';
     return;
   }
 
-  viewSnipesBtn.style.display = 'block';
   snipesCount.textContent = activeSnipes.length;
   noSnipesMsg.style.display = 'none';
   
