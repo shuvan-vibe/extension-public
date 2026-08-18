@@ -99,6 +99,7 @@ let dripAttempts = new Map();     // taskId -> real START attempts that failed
 let permaBlocked = new Map();     // taskId -> { at, reason }
 let dripRearms = new Map();       // taskId -> re-query count for the current chase
 let scheduledSnipes = new Map();  // releaseAt (sec) -> { preArmId, fireId, rearmId, taskIds:Set }
+let taskTitleCache = new Map();   // taskId -> title (for UI)
 let lastRefreshClickAt = 0;       // last reload-BUTTON click (bounces are not gated)
 
 // ─── Utility Functions ──────────────────────────────────────────────────────
@@ -1277,6 +1278,12 @@ async function queryDripSchedule(taskIds) {
 /** Handle a DRIP_INFO / DRIP_SCHEDULE payload from the radar server.
  *  Both carry { releaseAt, serverTime } plus a list of pending task IDs. */
 function handleDripInfo(msg) {
+  if (msg.titles) {
+    for (const [id, title] of Object.entries(msg.titles)) {
+      taskTitleCache.set(Number(id), title);
+    }
+  }
+
   const releaseAt = Number(msg.releaseAt);
   if (!releaseAt || !isFinite(releaseAt)) return;
 
@@ -1349,6 +1356,7 @@ function scheduleDripSnipe(releaseAt, targetMs, taskIds, skewMs) {
   const secs = ((targetMs - Date.now()) / 1000).toFixed(1);
   log(`🎯 Drip snipe armed: #${taskIds.join(', #')} releases in ${secs}s (skew ${Math.round(skewMs)}ms, jitter ${Math.round(jitter)}ms)`);
   sendMessage({ type: 'ADD_LOG', text: `🎯 Drip snipe armed: #${taskIds.join(', #')} in ${secs}s` });
+  broadcastSnipes();
 
   // ── T-2s: pre-arm. DOM only, zero network, zero detection surface. ──
   snipe.preArmId = workerTimeout(() => {
@@ -1369,6 +1377,7 @@ function scheduleDripSnipe(releaseAt, targetMs, taskIds, skewMs) {
     sendMessage({ type: 'TRIGGER_DIRECT_REFRESH', scheduled: true, taskIds: ids });
     if (scanTimer) clearTimeout(scanTimer);
     if (currentState === STATE.SCANNING) mainLoop();
+    broadcastSnipes();
   }, fireDelay);
 
   // ── T+jitter+3s: a release may include only a subset of pending IDs, so if our task never
@@ -1406,12 +1415,31 @@ function scheduleDripSnipe(releaseAt, targetMs, taskIds, skewMs) {
       log(`Release skipped #${chase.join(', #')} — re-querying next drip`);
       queryDripSchedule(chase);
     }
+    broadcastSnipes();
   }, fireDelay + CONFIG.DRIP_REARM_DELAY);
+}
+
+/** Broadcast active snipes to the background script for popup UI */
+function broadcastSnipes() {
+  const active = [];
+  for (const [releaseAt, snipe] of scheduledSnipes) {
+    if (releaseAt * 1000 < Date.now()) continue; // Past snipes
+    for (const id of snipe.taskIds) {
+      active.push({
+        taskId: id,
+        title: taskTitleCache.get(id) || `Task #${id}`,
+        releaseAt: releaseAt * 1000
+      });
+    }
+  }
+  sendMessage({ type: 'ACTIVE_SNIPES_UPDATE', snipes: active });
 }
 
 /** Helper to manage task failure state */
 function handleTaskFailure(taskId, errorReason, taskTitle = '') {
   if (taskId !== 'unknown') {
+    if (taskTitle) taskTitleCache.set(taskId, taskTitle);
+
     // Hard-fail reasons: don't retry these tasks at all
     const hardFailReasons = ['Account not linked', 'Task already completed', 'Task expired', 'blocked'];
     const isHardFail = hardFailReasons.some(r => errorReason.includes(r));
@@ -2037,6 +2065,22 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     // Radar published the next drip release time (or answered our targeted query)
     logDiagnostic('system', `${message.type} releaseAt=${message.releaseAt}`);
     handleDripInfo(message);
+    sendResponse({ ok: true });
+  } else if (message.type === 'CANCEL_SNIPE') {
+    const idToCancel = message.taskId;
+    for (const [releaseAt, snipe] of scheduledSnipes) {
+      if (snipe.taskIds.has(idToCancel)) {
+        snipe.taskIds.delete(idToCancel);
+        log(`❌ Cancelled scheduled snipe for #${idToCancel}`);
+        if (snipe.taskIds.size === 0) {
+          if (snipe.preArmId) clearWorkerTimeout(snipe.preArmId);
+          if (snipe.fireId) clearWorkerTimeout(snipe.fireId);
+          if (snipe.rearmId) clearWorkerTimeout(snipe.rearmId);
+          scheduledSnipes.delete(releaseAt);
+        }
+      }
+    }
+    broadcastSnipes();
     sendResponse({ ok: true });
   }
   return true;

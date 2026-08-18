@@ -26,6 +26,8 @@ const statUsdtEl = document.getElementById('statUsdt');
 const logContainer = document.getElementById('logContainer');
 const radarText = document.getElementById('radarText');
 const radarDot = document.getElementById('radarDot');
+const snipesSection = document.getElementById('snipesSection');
+const snipesContainer = document.getElementById('snipesContainer');
 
 // Settings Inputs
 const blockedKeywordsInput = document.getElementById('blockedKeywordsInput');
@@ -284,6 +286,26 @@ async function init() {
       });
     }
   });
+
+  // Snipes Container Event Delegation
+  snipesContainer.addEventListener('click', (e) => {
+    if (e.target.classList.contains('snipe-cancel-btn')) {
+      const taskId = e.target.getAttribute('data-id');
+      
+      // Add to blocklist
+      let blockedIds = blockedTaskIdsInput.value.split(',').map(id => id.trim()).filter(id => id.length > 0);
+      if (!blockedIds.includes(taskId)) {
+        blockedIds.push(taskId);
+        blockedTaskIdsInput.value = blockedIds.join(', ');
+        saveSettings();
+      }
+
+      // Send cancel message
+      chrome.runtime.sendMessage({ type: 'CANCEL_SNIPE', taskId });
+      e.target.textContent = 'Cancelling...';
+      e.target.disabled = true;
+    }
+  });
 }
 
 /** Show how many tasks are permanently skipped after burning all drip attempts */
@@ -410,6 +432,28 @@ function updateLog(activityLog) {
   }).join('');
 }
 
+function updateSnipes(activeSnipes) {
+  if (!activeSnipes || activeSnipes.length === 0) {
+    snipesSection.style.display = 'none';
+    snipesContainer.innerHTML = '';
+    return;
+  }
+
+  snipesSection.style.display = 'block';
+  snipesContainer.innerHTML = activeSnipes.map(snipe => {
+    const remainingSecs = Math.max(0, (snipe.releaseAt - Date.now()) / 1000).toFixed(0);
+    return `
+      <div class="snipe-item">
+        <div class="snipe-info">
+          <span class="snipe-title">${snipe.title}</span>
+          <span>Task #${snipe.taskId} • in ${remainingSecs}s</span>
+        </div>
+        <button class="snipe-cancel-btn" data-id="${snipe.taskId}">Cancel</button>
+      </div>
+    `;
+  }).join('');
+}
+
 function refreshStats() {
   chrome.runtime.sendMessage({ type: 'GET_STATE' }, (response) => {
     if (response) {
@@ -432,8 +476,12 @@ function refreshStats() {
         } else {
           radarDot.style.backgroundColor = '#f44336'; // red
           radarText.textContent = 'Radar: Disconnected';
+          radarText.textContent = 'Radar: Disconnected';
         }
       }
+
+      // Update Snipes
+      updateSnipes(response.stats?.activeSnipes || []);
     }
   });
 }

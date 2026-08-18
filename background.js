@@ -53,7 +53,8 @@ let stats = {
   activityLog: [],
   usdtEarned: 0,
   startedTaskIds: [],
-  failedTaskIds: []
+  failedTaskIds: [],
+  activeSnipes: []
 };
 
 // ─── Initialize ──────────────────────────────────────────────────────────────
@@ -511,6 +512,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'UPDATE_ICON':
       updateExtensionIcon(message.src);
+      sendResponse({ ok: true });
+      break;
+
+    case 'ACTIVE_SNIPES_UPDATE':
+      stats.activeSnipes = message.snipes || [];
+      sendResponse({ ok: true });
+      break;
+
+    case 'CANCEL_SNIPE':
+      if (foxigrowTabId) {
+        chrome.tabs.sendMessage(foxigrowTabId, { type: 'CANCEL_SNIPE', taskId: message.taskId });
+      }
       sendResponse({ ok: true });
       break;
 
