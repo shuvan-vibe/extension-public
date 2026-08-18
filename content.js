@@ -1475,9 +1475,9 @@ function handleTaskFailure(taskId, errorReason, taskTitle = '') {
       
       // If we know this task has a very small total slot pool, it's not worth sniping
       const totalSlots = taskTotalSlotsCache.get(taskId);
-      if (totalSlots !== undefined && totalSlots < 50) {
-        log(`Task #${taskId} skipped drip scheduling (Total slots: ${totalSlots} < 50)`);
-        blockTaskPermanently(taskId, `Total slots < 50 (${totalSlots})`);
+      if (totalSlots !== undefined && totalSlots < 30) {
+        log(`Task #${taskId} skipped drip scheduling (Total slots: ${totalSlots} < 30)`);
+        blockTaskPermanently(taskId, `Total slots < 30 (${totalSlots})`);
         return;
       }
 
