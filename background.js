@@ -51,7 +51,9 @@ let stats = {
   lastAction: null,
   lastAuthRefresh: null,
   activityLog: [],
-  usdtEarned: 0
+  usdtEarned: 0,
+  startedTaskIds: [],
+  failedTaskIds: []
 };
 
 // ─── Initialize ──────────────────────────────────────────────────────────────
@@ -64,29 +66,64 @@ chrome.runtime.onInstalled.addListener(() => {
   });
 });
 
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+function updateExtensionIcon(src) {
+  if (!src) return;
+  const url = chrome.runtime.getURL(src);
+  fetch(url)
+    .then(r => r.blob())
+    .then(createImageBitmap)
+    .then(bitmap => {
+      const canvas = new OffscreenCanvas(128, 128);
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(bitmap, 0, 0, 128, 128);
+      const imageData = ctx.getImageData(0, 0, 128, 128);
+      chrome.action.setIcon({ imageData: { "128": imageData } }, () => {
+        if (chrome.runtime.lastError) {
+          console.error('[FoxiExt-BG] Error setting icon:', chrome.runtime.lastError);
+        }
+      });
+    })
+    .catch(err => console.error('[FoxiExt-BG] Failed to update icon:', err));
+}
+
 // Load state on startup
 chrome.storage.local.get(['isEnabled', 'isPaused', 'stats', 'settings'], (data) => {
   isEnabled = data.isEnabled || false;
   isPaused = data.isPaused || false;
   if (data.stats) stats = { ...stats, ...data.stats };
-  if (data.settings && data.settings.radarServerUrl) {
-    connectRadar(data.settings.radarServerUrl);
+  if (data.settings) {
+    if (data.settings.radarServerUrl) {
+      connectRadar(data.settings.radarServerUrl);
+    }
+    if (data.settings.displayPicture) {
+      updateExtensionIcon(data.settings.displayPicture);
+    }
   }
 });
 
 // ─── Radar Server (WebSocket) ────────────────────────────────────────────────
 let radarWs = null;
 let radarReconnectTimer = null;
+let radarConnected = false;
+let radarHighestId = 0;
 let lastRadarReloadTime = 0;
 
-// Trigger the safe hardware-click fallback sequence via content.js
-function triggerRadarRefresh() {
+/** Trigger the safe hardware-click fallback sequence via content.js.
+ *  @param {object} opts
+ *  @param {boolean} opts.scheduled - true for a drip snipe fired by content.js at a known
+ *    release time. Scheduled snipes carry `bounceOnly` guidance and are never dropped by
+ *    the 12s signal cooldown, since missing the scheduled instant defeats the whole point.
+ *  @param {string[]} opts.taskIds - drip task IDs this refresh is targeting (for logging). */
+function triggerRadarRefresh(opts = {}) {
+  const { scheduled = false, taskIds = [] } = opts;
   getFoxiTabId().then(tabId => {
     if (!tabId) return;
     
     // 1. NATIVE TAB BOUNCE (Undetectable React Query Trigger)
     // To trigger React's `refetchOnWindowFocus` natively (with isTrusted=true),
     // we briefly switch the active tab to the Telegram tab, then instantly back.
+    // This path is NOT gated by FoxiGrow's client-side refresh-button cooldown.
     if (telegramTabId && telegramTabId !== tabId) {
       chrome.tabs.update(telegramTabId, { active: true }).then(() => {
         chrome.tabs.update(tabId, { active: true }).catch(() => {});
@@ -95,8 +132,20 @@ function triggerRadarRefresh() {
     }
     
     // 2. Notify content script to execute the safe, hardware-level refresh (native button click or DOM tab switch)
-    chrome.tabs.sendMessage(tabId, { type: 'RADAR_RELOAD' }).catch(() => {});
-    addToLog('🔄 Triggered hardware-level DOM refresh');
+    chrome.tabs.sendMessage(tabId, { type: 'RADAR_RELOAD', scheduled, taskIds }).catch(() => {});
+    if (scheduled) {
+      addToLog(`🎯 Drip snipe refresh${taskIds.length ? ` for #${taskIds.join(', #')}` : ''}`);
+    } else {
+      addToLog('🔄 Triggered hardware-level DOM refresh');
+    }
+  });
+}
+
+/** Forward a radar message to the FoxiGrow content script. */
+function forwardToFoxiTab(payload) {
+  getFoxiTabId().then(tabId => {
+    if (!tabId) return;
+    chrome.tabs.sendMessage(tabId, payload).catch(() => {});
   });
 }
 
@@ -112,6 +161,7 @@ function connectRadar(url) {
     radarWs = new WebSocket(url);
     
     radarWs.onopen = () => {
+      radarConnected = true;
       console.log('[FoxiExt-BG] Radar WS Connected');
       addToLog('📡 Radar Server Connected');
     };
@@ -119,10 +169,25 @@ function connectRadar(url) {
     radarWs.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        if (msg.taskId) {
+           radarHighestId = Math.max(radarHighestId, parseInt(msg.taskId, 10) || 0);
+        }
         if (msg.type === 'TASK_DROP') {
           console.log('[FoxiExt-BG] RADAR SIGNAL RECEIVED:', msg);
-          
-          if (isEnabled && !isPaused && foxigrowTabId) {
+
+          // Exactly two things may cause a DOM refresh:
+          //   1. a BRAND-NEW task appearing (this path, unchanged from before)
+          //   2. a scheduled snipe for a task we already tried and lost
+          //      (content.js → TRIGGER_DIRECT_REFRESH with scheduled: true)
+          //
+          // A drip-batch release carries a taskId and is deliberately NOT refreshed here.
+          // Radar announces every drip release, including tasks we never attempted, so
+          // refreshing on it would add traffic for tasks we aren't chasing. The tasks we
+          // ARE chasing are already covered by their own scheduled snipe, which is timed
+          // off releaseAt instead of reacting after the fact.
+          if (msg.taskId) {
+            console.log(`[FoxiExt-BG] Drip release for #${msg.taskId} — no refresh (snipe handles chased tasks)`);
+          } else if (isEnabled && !isPaused && foxigrowTabId) {
             const now = Date.now();
             if (now - lastRadarReloadTime >= 12000) {
               lastRadarReloadTime = now;
@@ -132,6 +197,13 @@ function connectRadar(url) {
               console.log(`[FoxiExt-BG] Radar signal ignored (12s cooldown active, wait ${waitSec}s)`);
             }
           }
+        } else if (msg.type === 'DRIP_SCHEDULE' || msg.type === 'DRIP_INFO') {
+          // Drip release clock / query answer. content.js owns all snipe scheduling
+          // because the service worker can be evicted and chrome.alarms only has
+          // 1-minute granularity, which is useless for a ~60s drip cycle.
+          if (isEnabled && !isPaused) {
+            forwardToFoxiTab(msg);
+          }
         }
       } catch (e) {
         console.error('[FoxiExt-BG] Error parsing WS message:', e);
@@ -139,11 +211,13 @@ function connectRadar(url) {
     };
 
     radarWs.onclose = () => {
+      radarConnected = false;
       console.log('[FoxiExt-BG] Radar WS Disconnected');
       radarReconnectTimer = setTimeout(() => connectRadar(url), 5000); // Reconnect in 5s
     };
 
     radarWs.onerror = (error) => {
+      radarConnected = false;
       console.error('[FoxiExt-BG] Radar WS Error:', error);
     };
   } catch (err) {
@@ -170,6 +244,21 @@ async function startLaunchFlow() {
   addToLog('🔄 Starting auth refresh flow...');
   pendingLaunch = true;
 
+  // Open Telegram Web to FoxiGrowBot FIRST to avoid closing the last tab
+  console.log('[FoxiExt-BG] Opening Telegram Web...');
+  const tab = await chrome.tabs.create({ url: TELEGRAM_URL, active: true });
+  const newTelegramTabId = tab.id;
+
+  // Ensure window is not minimized so Telegram can actually load
+  if (tab.windowId) {
+    try {
+      const win = await chrome.windows.get(tab.windowId);
+      if (win.state === 'minimized') {
+        await chrome.windows.update(tab.windowId, { state: 'normal', focused: true });
+      }
+    } catch (e) { /* ignore */ }
+  }
+
   // Close existing foxigrow tab if any
   if (foxigrowTabId) {
     try {
@@ -183,13 +272,9 @@ async function startLaunchFlow() {
     try {
       await chrome.tabs.remove(telegramTabId);
     } catch (e) { /* tab might already be closed */ }
-    telegramTabId = null;
   }
 
-  // Open Telegram Web to FoxiGrowBot
-  console.log('[FoxiExt-BG] Opening Telegram Web...');
-  const tab = await chrome.tabs.create({ url: TELEGRAM_URL, active: false });
-  telegramTabId = tab.id;
+  telegramTabId = newTelegramTabId;
   addToLog('📱 Opened Telegram Web, waiting for page load...');
 
   // The telegram-content.js will be injected automatically
@@ -201,6 +286,10 @@ async function handleMiniAppUrl(url) {
   console.log('[FoxiExt-BG] Mini app URL received:', url);
   addToLog('✅ Got fresh auth URL');
   pendingLaunch = false;
+
+  // Open the standalone foxigrow tab FIRST to avoid closing the browser
+  const tab = await chrome.tabs.create({ url: url, active: true });
+  const newFoxigrowTabId = tab.id;
 
   // Close the Telegram tab
   if (telegramTabId) {
@@ -215,9 +304,7 @@ async function handleMiniAppUrl(url) {
     } catch (e) { /* ignore */ }
   }
 
-  // Open the standalone foxigrow tab
-  const tab = await chrome.tabs.create({ url: url, active: false });
-  foxigrowTabId = tab.id;
+  foxigrowTabId = newFoxigrowTabId;
   
   // Attach debugger for anti-detect human clicks and stealth network interception
   try {
@@ -273,7 +360,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     const valid = await verifyLicenseInBackground();
     if (!valid) {
       addToLog('🛑 License expired. Stopping bot.');
-      sendTelegramMessage('🛑 *FoxiGrow Bot Stopped!*\nYour license key has expired or is invalid.');
+      sendTelegramMessage('🛑 <b>FoxiGrow Bot Stopped!</b>\nYour license key has expired or is invalid.');
       
       isEnabled = false;
       isPaused = false;
@@ -419,7 +506,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   switch (message.type) {
     // ── From Popup ──
     case 'GET_STATE':
-      sendResponse({ isEnabled, isPaused, stats, foxigrowTabId, pendingLaunch });
+      sendResponse({ isEnabled, isPaused, stats, foxigrowTabId, pendingLaunch, radarConnected, radarHighestId });
+      break;
+
+    case 'UPDATE_ICON':
+      updateExtensionIcon(message.src);
+      sendResponse({ ok: true });
       break;
 
     case 'TOGGLE_PAUSE':
@@ -436,7 +528,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         stats.sessionStart = Date.now();
         chrome.storage.local.set({ stats });
         addToLog('▶️ Extension enabled (Starting)');
-        sendTelegramMessage('🟢 *FoxiGrow Bot Started!*\nScanning for tasks...');
+        sendTelegramMessage('🟢 <b>FoxiGrow Bot Started!</b>\nScanning for tasks...');
         startLaunchFlow();
       } else {
         // Toggle pause state
@@ -444,9 +536,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.local.set({ isPaused });
         addToLog(isPaused ? '⏸ Bot paused' : '▶️ Bot resumed');
         if (!isPaused) {
-          sendTelegramMessage('▶️ *FoxiGrow Bot Resumed!*\nContinuing scan...');
+          sendTelegramMessage('▶️ <b>FoxiGrow Bot Resumed!</b>\nContinuing scan...');
         } else {
-          sendTelegramMessage('⏸ *FoxiGrow Bot Paused*');
+          sendTelegramMessage('⏸ <b>FoxiGrow Bot Paused</b>');
         }
       }
       
@@ -496,6 +588,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       pendingLaunch = false;
       addToLog(`❌ Launch failed: ${message.reason}`);
       console.error('[FoxiExt-BG] Launch failed:', message.reason);
+      
+      // Notify the user
+      chrome.notifications.create({
+        type: 'basic',
+        iconUrl: 'icons/icon128.png',
+        title: 'FoxiGrow Launch Failed',
+        message: `Failed to launch mini app: ${message.reason}. Retrying in 30 seconds.`,
+        priority: 2
+      });
+
       // Retry after 30 seconds
       setTimeout(() => {
         if (isEnabled) {
@@ -508,7 +610,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     // ── From FoxiGrow Content Script ──
     case 'TRIGGER_DIRECT_REFRESH':
-      triggerRadarRefresh();
+      // A scheduled drip snipe bypasses the 12s radar cooldown: drips are ~60s apart so
+      // this rarely collides, but a snipe swallowed by our own rate limiter is exactly the
+      // failure this feature exists to fix.
+      if (message.scheduled) {
+        lastRadarReloadTime = Date.now();
+        triggerRadarRefresh({ scheduled: true, taskIds: message.taskIds || [] });
+      } else {
+        triggerRadarRefresh();
+      }
       sendResponse({ ok: true });
       break;
 
@@ -528,17 +638,31 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'TASK_STARTED':
-      stats.tasksStarted++;
+      if (!stats.startedTaskIds) stats.startedTaskIds = [];
+      if (!stats.failedTaskIds) stats.failedTaskIds = [];
+
+      // If it was previously failed, remove it from the failed count
+      if (stats.failedTaskIds.includes(message.taskId)) {
+        stats.failedTaskIds = stats.failedTaskIds.filter(id => id !== message.taskId);
+        stats.tasksFailed = Math.max(0, stats.tasksFailed - 1);
+      }
+
+      // Count it only if it hasn't been started already
+      if (!stats.startedTaskIds.includes(message.taskId)) {
+        stats.startedTaskIds.push(message.taskId);
+        stats.tasksStarted++;
+      }
+
       stats.lastAction = Date.now();
-      addToLog(`✅ Started task #${message.taskId}`);
+      addToLog(`✅ Started task <span class="copy-id" title="Click to copy" data-id="${message.taskId}">${message.taskId}</span>`);
       chrome.storage.local.set({ stats });
       
       // Delay the notification slightly to ensure Network.getResponseBody has time to parse the claim URL
       setTimeout(() => {
         chrome.storage.local.get(['settings'], (data) => {
           const s = data.settings || {};
-          // Clean dynamic text to prevent Telegram Markdown parsing errors
-          const cleanTG = (str) => (str || '').replace(/[_*[\]`]/g, '');
+          // Clean dynamic text to prevent Telegram HTML parsing errors
+          const cleanTG = (str) => (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           const title = cleanTG(message.taskTitle) || `Task #${message.taskId}`;
           
           // Use intercepted URL from the API claim response (100% accurate)
@@ -559,8 +683,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           // Telegram Notification
           if (s.tgNotif) {
             const safeTaskId = cleanTG(message.taskId);
-            const usdtText = message.usdtReward ? `\n*Reward:* +${message.usdtReward} USDT` : '';
-            const text = `🚀 *FoxiGrow Task Started!*\n\n*Task ID:* #${safeTaskId}\n*Title:* ${title}${usdtText}\n*Link:* ${url}`;
+            const usdtText = message.usdtReward ? `\n<b>Reward:</b> +${message.usdtReward} USDT` : '';
+            const text = `🚀 <b>FoxiGrow Task Started!</b>\n\n<b>Task ID:</b> #${safeTaskId}\n<b>Title:</b> ${title}${usdtText}\n<b>Link:</b> ${url}`;
             sendTelegramMessage(text);
           }
         });
@@ -570,21 +694,29 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       break;
 
     case 'TASK_FAILED':
-      stats.tasksFailed++;
+      if (!stats.startedTaskIds) stats.startedTaskIds = [];
+      if (!stats.failedTaskIds) stats.failedTaskIds = [];
+
+      // If it hasn't succeeded yet and wasn't already failed, count it
+      if (!stats.startedTaskIds.includes(message.taskId) && !stats.failedTaskIds.includes(message.taskId)) {
+        stats.failedTaskIds.push(message.taskId);
+        stats.tasksFailed++;
+      }
+
       stats.lastAction = Date.now();
-      addToLog(`❌ Failed task #${message.taskId}: ${message.reason || 'unknown'}`);
+      addToLog(`❌ Failed task <span class="copy-id" title="Click to copy" data-id="${message.taskId}">${message.taskId}</span>: ${message.reason || 'unknown'}`);
       chrome.storage.local.set({ stats });
 
       // Telegram Notification for Failed Task
       chrome.storage.local.get('settings', (data) => {
         const s = data.settings || {};
-        if (s.tgNotif) {
-          const cleanTG = (str) => (str || '').replace(/[_*[\]`]/g, '');
+        if (s.tgNotif && s.tgTaskFailed !== false) {
+          const cleanTG = (str) => (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           const safeTaskId = cleanTG(message.taskId);
           const title = cleanTG(message.taskTitle) || `Task #${safeTaskId}`;
-          const usdtText = message.usdtReward ? `\n*Reward:* +${message.usdtReward} USDT` : '';
-          const reasonText = message.reason ? `\n*Reason:* ${cleanTG(message.reason)}` : '';
-          const text = `⚠️ *FoxiGrow Task Failed!*\n\n*Task ID:* #${safeTaskId}\n*Title:* ${title}${usdtText}${reasonText}`;
+          const usdtText = message.usdtReward ? `\n<b>Reward:</b> +${message.usdtReward} USDT` : '';
+          const reasonText = message.reason ? `\n<b>Reason:</b> ${cleanTG(message.reason)}` : '';
+          const text = `⚠️ <b>FoxiGrow Task Failed!</b>\n\n<b>Task ID:</b> #${safeTaskId}\n<b>Title:</b> ${title}${usdtText}${reasonText}`;
           sendTelegramMessage(text);
         }
       });
@@ -667,28 +799,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       sendResponse({ data: output });
       break;
 
-    case 'FETCH_DRIP_SCHEDULE':
-      // Fetch drip schedule from Railway proxy in service worker context
-      // (no CORS issues, invisible to page's CSP and Cloudflare)
-      (async () => {
+    case 'DRIP_QUERY':
+      // Ask the radar server when the next drip batch releases for these task IDs.
+      // Radar answers from its cached dripSummary, so this costs FoxiGrow zero requests.
+      // The reply arrives asynchronously as a DRIP_INFO message via radarWs.onmessage.
+      if (radarWs && radarWs.readyState === 1) {
         try {
-          const endpoint = `https://polling-production-db64.up.railway.app/drip-schedule/${message.taskId}`;
-          const res = await fetch(endpoint, {
-            method: 'GET',
-            headers: { 'Accept': 'application/json' }
-          });
-          if (!res.ok) {
-            sendResponse(null);
-            return;
-          }
-          const data = await res.json();
-          sendResponse(data);
+          radarWs.send(JSON.stringify({
+            type: 'DRIP_QUERY',
+            taskIds: (message.taskIds || []).map(String)
+          }));
+          sendResponse({ ok: true });
         } catch (e) {
-          console.error('[FoxiExt-BG] Drip schedule fetch failed:', e);
-          sendResponse(null);
+          console.error('[FoxiExt-BG] DRIP_QUERY send failed:', e);
+          sendResponse({ ok: false, reason: 'send_failed' });
         }
-      })();
-      return true; // async response
+      } else {
+        sendResponse({ ok: false, reason: 'ws_closed' });
+      }
+      break;
 
     case 'PING':
       // Heartbeat to keep service worker alive
@@ -816,7 +945,7 @@ function sendTelegramMessage(text) {
         body: JSON.stringify({
           chat_id: s.tgChatId,
           text: text,
-          parse_mode: 'Markdown'
+          parse_mode: 'HTML'
         })
       }).then(res => res.json())
         .then(data => {
@@ -842,11 +971,11 @@ function buildSessionSummary() {
     durationText = hours > 0 ? `${hours}h ${minutes}m` : `${minutes}m`;
   }
 
-  return `📊 *FoxiGrow Session Summary*\n\n` +
-    `⏱ *Duration:* ${durationText}\n` +
-    `✅ *Tasks Started:* ${stats.tasksStarted || 0}\n` +
-    `❌ *Tasks Failed:* ${stats.tasksFailed || 0}\n` +
-    `💰 *USDT Earned:* ${(stats.usdtEarned || 0).toFixed(2)}\n\n` +
+  return `📊 <b>FoxiGrow Session Summary</b>\n\n` +
+    `⏱ <b>Duration:</b> ${durationText}\n` +
+    `✅ <b>Tasks Started:</b> ${stats.tasksStarted || 0}\n` +
+    `❌ <b>Tasks Failed:</b> ${stats.tasksFailed || 0}\n` +
+    `💰 <b>USDT Earned:</b> ${(stats.usdtEarned || 0).toFixed(2)}\n\n` +
     `Bot has been stopped.`;
 }
 
@@ -862,6 +991,8 @@ function endSession() {
   stats.usdtEarned = 0;
   stats.sessionStart = null;
   stats.activityLog = [];
+  stats.startedTaskIds = [];
+  stats.failedTaskIds = [];
   chrome.storage.local.set({ stats });
 }
 

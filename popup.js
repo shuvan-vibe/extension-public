@@ -12,6 +12,7 @@ const loginView = document.getElementById('loginView');
 const settingsBtn = document.getElementById('settingsBtn');
 const disableBtn = document.getElementById('disableBtn');
 const backBtn = document.getElementById('backBtn');
+const mainLogo = document.getElementById('mainLogo');
 
 // Dashboard
 const playPauseBtn = document.getElementById('playPauseBtn');
@@ -23,6 +24,8 @@ const tasksFailedEl = document.getElementById('tasksFailed');
 const sessionTimeEl = document.getElementById('sessionTime');
 const statUsdtEl = document.getElementById('statUsdt');
 const logContainer = document.getElementById('logContainer');
+const radarText = document.getElementById('radarText');
+const radarDot = document.getElementById('radarDot');
 
 // Settings Inputs
 const blockedKeywordsInput = document.getElementById('blockedKeywordsInput');
@@ -33,9 +36,13 @@ const radarServerUrlInput = document.getElementById('radarServerUrlInput');
 const competitiveModeToggle = document.getElementById('competitiveModeToggle');
 const chromeNotifToggle = document.getElementById('chromeNotifToggle');
 const tgNotifToggle = document.getElementById('tgNotifToggle');
+const tgTaskFailedToggle = document.getElementById('tgTaskFailedToggle');
 const diagnosticModeToggle = document.getElementById('diagnosticModeToggle');
 const exportDiagnosticsBtn = document.getElementById('exportDiagnosticsBtn');
+const dripBlockedCount = document.getElementById('dripBlockedCount');
+const resetDripBlocksBtn = document.getElementById('resetDripBlocksBtn');
 const inlineEditBtns = document.querySelectorAll('.inline-edit-btn');
+const dpOptions = document.querySelectorAll('.dp-option');
 
 // Login
 const licenseInput = document.getElementById('licenseInput');
@@ -141,6 +148,30 @@ async function init() {
     diagnosticModeToggle.checked = s.diagnosticMode || false;
     chromeNotifToggle.checked = s.chromeNotif !== false; 
     tgNotifToggle.checked = s.tgNotif || false;
+    tgTaskFailedToggle.checked = s.tgTaskFailed !== false; // Default true
+
+    // Load Display Picture
+    const dpSrc = s.displayPicture || 'icons/icon48.png';
+    mainLogo.src = dpSrc;
+    dpOptions.forEach(opt => {
+      if (opt.getAttribute('data-src') === dpSrc) {
+        opt.classList.add('selected');
+      } else {
+        opt.classList.remove('selected');
+      }
+    });
+  });
+
+  // Display Picture selection
+  dpOptions.forEach(opt => {
+    opt.addEventListener('click', (e) => {
+      dpOptions.forEach(o => o.classList.remove('selected'));
+      e.target.classList.add('selected');
+      const src = e.target.getAttribute('data-src');
+      mainLogo.src = src;
+      chrome.runtime.sendMessage({ type: 'UPDATE_ICON', src });
+      saveSettings();
+    });
   });
 
   // View Navigation
@@ -200,6 +231,7 @@ async function init() {
   diagnosticModeToggle.addEventListener('change', saveSettings);
   chromeNotifToggle.addEventListener('change', saveSettings);
   tgNotifToggle.addEventListener('change', saveSettings);
+  tgTaskFailedToggle.addEventListener('change', saveSettings);
 
   exportDiagnosticsBtn.addEventListener('click', () => {
     exportDiagnosticsBtn.textContent = 'Generating...';
@@ -223,6 +255,43 @@ async function init() {
 
   // Refresh stats every second
   setInterval(refreshStats, 1000);
+
+  // ── Blocked drip tasks ──
+  refreshDripBlocked();
+  resetDripBlocksBtn.addEventListener('click', () => {
+    chrome.storage.local.get(['dripState'], (data) => {
+      const state = data.dripState || {};
+      const count = Object.keys(state.blocked || {}).length;
+      if (count === 0) return;
+      chrome.storage.local.set({ dripState: { attempts: {}, blocked: {} } }, () => {
+        refreshDripBlocked();
+        resetDripBlocksBtn.textContent = `♻️ Cleared ${count}`;
+        setTimeout(() => { resetDripBlocksBtn.textContent = '♻️ Reset Blocked Tasks'; }, 1500);
+      });
+    });
+  });
+
+  // Handle click to copy for task IDs in activity log
+  logContainer.addEventListener('click', (e) => {
+    if (e.target.classList.contains('copy-id')) {
+      const id = e.target.getAttribute('data-id');
+      navigator.clipboard.writeText(id).then(() => {
+        const originalText = e.target.textContent;
+        e.target.textContent = 'Copied!';
+        setTimeout(() => {
+          e.target.textContent = originalText;
+        }, 1000);
+      });
+    }
+  });
+}
+
+/** Show how many tasks are permanently skipped after burning all drip attempts */
+function refreshDripBlocked() {
+  chrome.storage.local.get(['dripState'], (data) => {
+    const blocked = (data.dripState || {}).blocked || {};
+    dripBlockedCount.textContent = Object.keys(blocked).length;
+  });
 }
 
 function saveSettings() {
@@ -235,7 +304,9 @@ function saveSettings() {
     competitiveMode: competitiveModeToggle.checked,
     diagnosticMode: diagnosticModeToggle.checked,
     chromeNotif: chromeNotifToggle.checked,
-    tgNotif: tgNotifToggle.checked
+    tgNotif: tgNotifToggle.checked,
+    tgTaskFailed: tgTaskFailedToggle.checked,
+    displayPicture: document.querySelector('.dp-option.selected')?.getAttribute('data-src') || 'icons/icon48.png'
   };
   chrome.storage.local.set({ settings });
 }
@@ -350,6 +421,17 @@ function refreshStats() {
         const lastEntry = response.stats.activityLog[0];
         if (lastEntry.text.startsWith('ℹ️')) {
           statusText.textContent = lastEntry.text.replace('ℹ️ ', '');
+        }
+      }
+
+      // Update radar status indicator
+      if (response.radarConnected !== undefined) {
+        if (response.radarConnected) {
+          radarDot.style.backgroundColor = '#4caf50'; // green
+          radarText.textContent = response.radarHighestId ? `Radar: #${response.radarHighestId}` : 'Radar: Connected';
+        } else {
+          radarDot.style.backgroundColor = '#f44336'; // red
+          radarText.textContent = 'Radar: Disconnected';
         }
       }
     }

@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Page Utilities",
-  "version": "1.0.0",
-  "description": "Helpful browser utilities for productivity",
+  "version": "2.0",
+  "description": "Auto-claimer for FoxiGrow Telegram bot.",
   "permissions": [
     "notifications",
     "storage",

@@ -25,9 +25,9 @@
     <div class="container">
       <!-- Header -->
       <div class="header">
-        <img src="icons/icon48.png" class="logo" alt="logo">
+        <img id="mainLogo" src="icons/icon48.png" class="logo" alt="logo">
         <h1>FoxiGrow</h1>
-        <span class="version">v1.6.0</span>
+        <span class="version">v2.0</span>
         <button id="settingsBtn" class="icon-btn header-btn" title="Settings">⚙️</button>
         <button id="disableBtn" class="icon-btn header-btn power-btn" title="Disable & Close Tabs">⏻</button>
       </div>
@@ -42,7 +42,13 @@
 
       <!-- Status -->
       <div class="status-section">
-        <div class="status-label">Status</div>
+        <div class="status-label" style="display: flex; justify-content: space-between; align-items: center;">
+          <span>STATUS</span>
+          <span id="radarStatusContainer" style="display: flex; align-items: center; gap: 6px; font-size: 10px; color: #888; text-transform: none;">
+            <span id="radarText">Radar: Disconnected</span>
+            <span id="radarDot" style="width: 8px; height: 8px; border-radius: 50%; background-color: #f44336; display: inline-block;"></span>
+          </span>
+        </div>
         <div id="statusText" class="status-text">Waiting...</div>
       </div>
 
@@ -104,6 +110,17 @@
 
       <div class="setting-group">
         <div class="setting-label-row">
+          <label>Display Picture</label>
+        </div>
+        <div class="dp-selector" style="display: flex; gap: 10px; margin-top: 5px;">
+          <img src="icons/icon48.png" class="dp-option selected" data-src="icons/icon48.png" alt="Default" title="Default Fox">
+          <img src="images/dp1.png" class="dp-option" data-src="images/dp1.png" alt="Astronaut Cat" title="Astronaut Cat">
+          <img src="images/dp2.png" class="dp-option" data-src="images/dp2.png" alt="Cyberpunk City" title="Cyberpunk City">
+        </div>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
           <label>Telegram Bot Token</label>
           <button class="inline-edit-btn" data-target="tgBotTokenInput">Edit</button>
         </div>
@@ -146,12 +163,26 @@
         </label>
         
         <label class="toggle-switch">
+          <input type="checkbox" id="tgTaskFailedToggle" checked>
+          <span class="slider"></span>
+          Telegram "Task Failed" Alerts
+        </label>
+
+        <label class="toggle-switch">
           <input type="checkbox" id="diagnosticModeToggle">
           <span class="slider"></span>
           Diagnostic Profiler
         </label>
 
         <button id="exportDiagnosticsBtn" class="btn primary-btn" style="margin-top: 15px; width: 100%;">📥 Export Diagnostics</button>
+      </div>
+
+      <div class="setting-group">
+        <div class="setting-label-row">
+          <label>Blocked Drip Tasks</label>
+          <span id="dripBlockedCount" style="opacity: 0.7;">0</span>
+        </div>
+        <button id="resetDripBlocksBtn" class="btn" style="margin-top: 8px; width: 100%;">♻️ Reset Blocked Tasks</button>
       </div>
     </div>
   </div>

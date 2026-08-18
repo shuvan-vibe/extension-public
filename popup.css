@@ -418,3 +418,28 @@ select option {
 .active-key-item .terminate-btn:hover {
   background: #ff2222;
 }
+
+/* Copy ID inside logs */
+.copy-id {
+  color: #007bff;
+  cursor: pointer;
+  text-decoration: underline;
+}
+.copy-id:hover {
+  color: #3399ff;
+}
+
+/* DP Selector */
+.dp-selector img {
+  width: 40px;
+  height: 40px;
+  border-radius: 50%;
+  cursor: pointer;
+  border: 2px solid transparent;
+  transition: all 0.2s;
+  object-fit: cover;
+}
+.dp-selector img.selected {
+  border-color: #007bff;
+  transform: scale(1.1);
+}

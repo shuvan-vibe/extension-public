@@ -39,6 +39,25 @@ const CONFIG = {
   RESULT_WAIT_TIMEOUT:       5000,
   SCAN_INTERVAL:            { min: 1500, max: 3000 },     // 1.5-3s variable
 
+  // Max wait for the GO button to finish the sheet's slide-up animation.
+  // Polled every 30ms and exits the instant it's on-screen, so a fast modal pays
+  // nothing — this ceiling only applies when the animation is genuinely slow.
+  GO_VIEWPORT_MAX_WAIT:     900,
+
+  // ── DRIP SNIPING ──
+  // A drip task releases its slots in batches at server-defined timestamps. Missing a
+  // batch means waiting for the next one, so we schedule a refresh to land right on it.
+  DRIP_MAX_ATTEMPTS:        3,      // real START attempts before a task is blocked forever
+  DRIP_PREARM_MS:           2000,   // start the 16ms scanner this early (DOM-only, no network)
+  DRIP_JITTER_MIN:          200,    // refresh fires at releaseAt + 200..900ms (never a fixed offset)
+  DRIP_JITTER_VAR:          700,
+  DRIP_SCAN_WINDOW:         12000,  // must cover release + the ~10s slot drain
+  DRIP_REARM_DELAY:         3000,   // after a release, re-query if our task never appeared
+  DRIP_MAX_REARMS:          5,      // bound the loop when a task stops dripping entirely
+  DRIP_COALESCE_MS:         10000,  // merge snipes landing within this window into one refresh
+  DRIP_REFRESH_LOCK_MS:     10000,  // FoxiGrow's client-side refresh-button cooldown
+  DRIP_BLOCK_TTL_MS:        604800000, // prune blocked entries after 7 days
+
   // Safety
   MAX_CONSECUTIVE_ERRORS:   5,
 };
@@ -70,6 +89,17 @@ let scanTimer = null;
 let observer = null;
 let nextReloadTime = 0;
 let nextHardReloadTime = 0;
+
+// ─── Drip Snipe State ────────────────────────────────────────────────────────
+// dripAttempts / permaBlocked are mirrored into chrome.storage.local because content.js
+// reloads the page on stale-cache errors and hard-reloads every 10-15 minutes, both of
+// which wipe in-memory state. An in-memory counter would reset before reaching 3 and the
+// task would be retried forever.
+let dripAttempts = new Map();     // taskId -> real START attempts that failed
+let permaBlocked = new Map();     // taskId -> { at, reason }
+let dripRearms = new Map();       // taskId -> re-query count for the current chase
+let scheduledSnipes = new Map();  // releaseAt (sec) -> { preArmId, fireId, rearmId, taskIds:Set }
+let lastRefreshClickAt = 0;       // last reload-BUTTON click (bounces are not gated)
 
 // ─── Utility Functions ──────────────────────────────────────────────────────
 
@@ -459,6 +489,72 @@ function findAllElementsByText(selector, text) {
 }
 
 /**
+ * Normalize label text for comparison: lowercase, strip emoji/punctuation.
+ * FoxiGrow prefixes labels with icons ("🚫Hide", "🌐Language", "📍Region"),
+ * so exact-equality checks against "hide" silently fail without this.
+ */
+function normText(s) {
+  return (s || '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Is the element actually rendered inside the viewport?
+ * Modals always are. Task-list cards further down the scroll container are NOT
+ * (e.g. a started task's card sitting at top=2173 with a 945px viewport), which
+ * is exactly the state that used to be mistaken for "a modal is open".
+ */
+function isInViewport(el) {
+  if (!el) return false;
+  const r = el.getBoundingClientRect();
+  if (r.width === 0 || r.height === 0) return false;
+  return r.bottom > 0 && r.top < window.innerHeight;
+}
+
+/**
+ * Resolve the bottom-sheet modal container by walking up from an anchor element
+ * (the modal's Cancel or GO button). Stops before climbing into the app shell,
+ * so the returned container never includes the background task list.
+ */
+function getModalContainer(anchorEl) {
+  if (!anchorEl) return null;
+  const totalBtns = document.querySelectorAll('button').length;
+  let node = anchorEl;
+  let best = anchorEl;
+  let depth = 0;
+
+  while (node && node !== document.body && depth < 10) {
+    const btnCount = node.querySelectorAll('button').length;
+    // Bail out if this ancestor holds most of the page's buttons — that means
+    // we've climbed past the sheet into the whole app root.
+    if (totalBtns > 4 && btnCount > totalBtns * 0.6) break;
+
+    best = node;
+    const r = node.getBoundingClientRect();
+    // A sheet is tall and holds at least the Cancel + GO pair
+    if (btnCount >= 2 && r.height >= window.innerHeight * 0.25) break;
+
+    node = node.parentElement;
+    depth++;
+  }
+  return best;
+}
+
+/**
+ * Snapshot the "task started" markers that ALREADY exist before we click START.
+ * A task that started moments ago keeps its 30s timer card (TIME LEFT / Copy Link
+ * / Upload Screenshot) mounted in the list, so counting those markers globally
+ * produces phantom successes for the NEXT task. We only ever count NEW ones.
+ */
+function snapshotStartedMarkers() {
+  return {
+    copyLink:  new Set(findAllElementsByText('button', 'copy link')),
+    upload:    new Set(findAllElementsByText('button, div, span', 'Upload Screenshot')),
+    continues: new Set(findAllElementsByText('button', 'continue')),
+    timeLeft:  (document.body.innerText.match(/TIME LEFT/gi) || []).length,
+  };
+}
+
+/**
  * Extract taskId from the task card.
  * FoxiGrow puts the ID as `#12345` inside the card text.
  */
@@ -707,6 +803,9 @@ function findStartableTasks() {
     // Only click START buttons
     if (task.buttonText !== 'start') return false;
 
+    // Permanently blocked: burned all its drip attempts in an earlier session
+    if (permaBlocked.has(task.taskId)) return false;
+
     // Check if previously successfully started (or hard failed in this run)
     if (processedTaskIds.has(task.taskId)) return false;
 
@@ -746,38 +845,39 @@ function findStartableTasks() {
 
 /** Check if the bottom-sheet modal is currently open */
 function isModalOpen() {
-  // The modal typically has a dark backdrop and a sheet sliding up from bottom
-  // Look for common indicators:
-  // 1. A backdrop/overlay element covering the screen
-  // 2. Action buttons like CANCEL + GO FOLLOW/GO VISIT/GO LIKE
-  const cancelBtn = findElementByText('button', 'cancel');
+  // The pre-start modal is uniquely identified by its Cancel button, and a real
+  // modal is ALWAYS on-screen. We deliberately do NOT treat "Upload Screenshot"
+  // as proof of an open modal: that marker also belongs to a previously started
+  // task's list card, which stays mounted for ~30s and used to make this return
+  // true before the current task's modal had rendered.
+  const cancelBtn = findAllElementsByText('button', 'cancel').find(isInViewport);
   if (cancelBtn) return true;
 
-  // Also check for the task detail modal (after starting)
-  const uploadBtn = findElementByText('button, div, span', 'Upload Screenshot');
+  // Post-start view of the CURRENT task (on-screen only)
+  const uploadBtn = findAllElementsByText('button, div, span', 'Upload Screenshot').find(isInViewport);
   if (uploadBtn) return true;
 
   return false;
 }
 
-/** Find the GO action button in the modal (GO FOLLOW, GO VISIT, GO LIKE, GO RETWEET, etc.) */
-function findGoActionButton() {
-  // ── DIAGNOSTIC: Always log what buttons exist ──
-  const allBtns = document.querySelectorAll('button');
-  const btnDump = Array.from(allBtns).map(b => {
-    const r = b.getBoundingClientRect();
-    return `"${b.textContent.trim().substring(0,50)}" tag=${b.tagName} top=${Math.round(r.top)} vis=${r.width>0}`;
-  });
-  console.log('[FoxiExt-DIAG] All buttons on page:', JSON.stringify(btnDump));
-  
-  const allLinks = document.querySelectorAll('a');
-  const linkDump = Array.from(allLinks).map(a => {
-    return `"${a.textContent.trim().substring(0,40)}" href=${(a.href||'').substring(0,50)}`;
-  });
-  console.log('[FoxiExt-DIAG] All links on page:', JSON.stringify(linkDump));
+/** Find the GO action button in the modal (GO FOLLOW, GO VISIT, GO LIKE, GO RETWEET, etc.)
+ *  @param {Element|null} scope - the resolved modal container. When provided, the search
+ *  NEVER leaves it, so background task-list buttons (Hide/Language/Region) can't be hit. */
+function findGoActionButton(scope = null) {
+  const root = scope || document;
+  const allBtns = root.querySelectorAll('button');
+
+  // ── DIAGNOSTIC (only when explicitly enabled — keeps the hot path fast) ──
+  if (DEBUG) {
+    const btnDump = Array.from(allBtns).map(b => {
+      const r = b.getBoundingClientRect();
+      return `"${b.textContent.trim().substring(0,50)}" tag=${b.tagName} top=${Math.round(r.top)} vis=${r.width>0}`;
+    });
+    console.log(`[FoxiExt-DIAG] Buttons in ${scope ? 'MODAL' : 'page'}:`, JSON.stringify(btnDump));
+  }
 
   // ── Strategy 1: Text-based matching across ALL elements ──
-  const allElements = document.querySelectorAll('button, a, div, span');
+  const allElements = root.querySelectorAll('button, a, div, span');
   
   // Keywords that MUST be prefixed with "go " to match (too common in task titles otherwise)
   const goOnlyKeywords = ['follow', 'like', 'retweet', 'join', 'watch', 'subscribe', 'visit'];
@@ -786,15 +886,17 @@ function findGoActionButton() {
   
   const ignoreExact = ['submit', 'cancel', 'verify', 'check', 'got it', 'close', 'start', 'claim',
                         'upload screenshot', 'time left', 'copy link', 'tasks', 'leaderboard', 
-                        'available', 'completed', 'task center', 'continue', 'browse other quests'];
+                        'available', 'completed', 'task center', 'continue', 'browse other quests',
+                        'hide', 'language', 'region', 'please wait'];
   
   const matches = [];
   
   for (const el of allElements) {
-    const text = el.textContent.trim().toLowerCase();
+    const text = normText(el.textContent);
     if (!text || text.length > 25) continue;  // GO buttons are short (e.g. "Go Follow", "Go Visit")
-    if (text.includes('[#')) continue;
+    if (el.textContent.includes('[#')) continue;
     if (ignoreExact.includes(text)) continue;
+    if (text.startsWith('please wait')) continue;  // start cooldown / timer button
     
     // Check if text starts with "go " (strongest signal)
     const startsWithGo = text.startsWith('go ');
@@ -817,11 +919,10 @@ function findGoActionButton() {
     // Skip if it also contains ignore words (prevents matching parent containers)
     if (text.includes('cancel') || text.includes('upload') || text.includes('start')) continue;
     
-    // Visual check: element should be visible and in the modal area (not behind it)
-    const elRect = el.getBoundingClientRect();
-    if (elRect.width === 0 || elRect.height === 0) continue; // hidden element
+    // Visual check: element must be visible AND on-screen
+    if (!isInViewport(el)) continue;
     
-    console.log(`[FoxiExt-DIAG] Strategy 1 MATCH: <${el.tagName}> "${text}"`);
+    if (DEBUG) console.log(`[FoxiExt-DIAG] Strategy 1 MATCH: <${el.tagName}> "${text}"`);
     matches.push({ el, text, tag: el.tagName.toLowerCase() });
   }
 
@@ -844,10 +945,17 @@ function findGoActionButton() {
     return matches[0].el;
   }
   
-  // ── Strategy 2: Positional fallback — find buttons in the MODAL area only ──
-  // FoxiGrow uses a bottom-sheet modal, so real GO buttons are in the lower portion of the viewport.
-  // We must filter out all task-list and navigation buttons from the background page.
-  console.log('[FoxiExt-DIAG] Strategy 1 found NO matches, trying positional fallback...');
+  // ── Strategy 2: Positional fallback — MODAL-SCOPED ONLY ──
+  // Previously this scanned every button on the page and filtered by y-position,
+  // which discarded the real modal content (below the fold) and returned the task
+  // list's "🚫Hide" button instead — hiding the task instead of starting it.
+  // Without a resolved modal container we now refuse to guess.
+  if (DEBUG) console.log('[FoxiExt-DIAG] Strategy 1 found NO matches, trying positional fallback...');
+  
+  if (!scope) {
+    if (DEBUG) console.warn('[FoxiExt-DIAG] No modal scope — refusing page-wide fallback (would risk clicking list buttons)');
+    return null;
+  }
   
   const ignoreTexts = [
     'cancel', 'start', 'got it', 'close', 'tasks', 'leaderboard', 'continue',
@@ -856,50 +964,53 @@ function findGoActionButton() {
     'all', 'twitter', 'youtube', 'github', 'website', 'websites', 'tiktok', 'telegram',
     // Task list UI
     'link tiktok account', 'task center', 'history', 'available', 'completed',
+    // Per-card / global controls that must NEVER be clicked as a GO action
+    'hide', 'language', 'region',
   ];
   
   const modalButtons = Array.from(allBtns).filter(btn => {
-    const text = btn.textContent.trim().toLowerCase();
+    const text = normText(btn.textContent);
     if (!text) return false;
     
     // Skip known non-GO buttons
     if (ignoreTexts.includes(text)) return false;
     
-    // Skip "Hidden (N)" style buttons (task list expand toggles)
-    if (text.startsWith('hidden')) return false;
+    // Skip "Hidden (N)" / "Hide" style buttons (task list controls)
+    if (text.startsWith('hidden') || text.startsWith('hide')) return false;
+    
+    // Skip timer / cooldown buttons ("Please wait 0:22")
+    if (text.startsWith('please wait')) return false;
     
     // Skip buttons with task-list content (prices, stats, IDs)
-    if (text.includes('+') || text.includes('#') || text.includes('$')) return false;
+    const raw = btn.textContent;
+    if (raw.includes('+') || raw.includes('#') || raw.includes('$')) return false;
     
     // Skip very long text (GO buttons are short)
     if (text.length > 20) return false;
     
+    if (!isInViewport(btn)) return false;
+    
     const rect = btn.getBoundingClientRect();
-    if (rect.width === 0 || rect.height === 0) return false; // hidden
     if (rect.bottom > window.innerHeight - 60) return false; // bottom nav bar
     if (rect.top < 10) return false; // top bar
     
-    // Must be in the bottom-sheet modal area (lower ~60% of viewport)
-    // Task list buttons are typically in the top portion, modal content is in the bottom sheet
-    const modalAreaTop = window.innerHeight * 0.35;
-    if (rect.top < modalAreaTop) {
-      console.log(`[FoxiExt-DIAG] Strategy 2 SKIPPED (above modal area): "${btn.textContent.trim()}" top=${Math.round(rect.top)}`);
-      return false;
-    }
-    
-    console.log(`[FoxiExt-DIAG] Strategy 2 candidate: "${btn.textContent.trim()}" top=${Math.round(rect.top)}`);
+    if (DEBUG) console.log(`[FoxiExt-DIAG] Strategy 2 candidate: "${btn.textContent.trim()}" top=${Math.round(rect.top)}`);
     return true;
   });
   
   if (modalButtons.length > 0) {
-    const chosen = modalButtons[modalButtons.length - 1]; // last = usually the action button at bottom of modal
-    log(`GO button found (positional fallback): <button> "${chosen.textContent.trim()}"`);
+    // Pick the LOWEST on screen — the sheet's primary action sits at the bottom.
+    // (Document order is not screen order, which the old code assumed.)
+    const chosen = modalButtons.reduce((a, b) =>
+      b.getBoundingClientRect().top > a.getBoundingClientRect().top ? b : a
+    );
+    log(`GO button found (positional fallback, modal-scoped): <button> "${chosen.textContent.trim()}"`);
     return chosen;
   }
 
   // ── Strategy 3: NUCLEAR — find the sibling of CANCEL button ──
-  console.log('[FoxiExt-DIAG] Strategy 2 found NO matches, trying nuclear fallback...');
-  const cancelBtn = findElementByText('button', 'cancel');
+  if (DEBUG) console.log('[FoxiExt-DIAG] Strategy 2 found NO matches, trying nuclear fallback...');
+  const cancelBtn = findAllElementsByText('button', 'cancel').find(isInViewport);
   if (cancelBtn) {
     // The GO button is usually a sibling of CANCEL in the same parent container
     const parent = cancelBtn.parentElement;
@@ -907,26 +1018,24 @@ function findGoActionButton() {
       const siblings = Array.from(parent.children);
       for (const sib of siblings) {
         if (sib === cancelBtn) continue;
-        const sibText = sib.textContent.trim().toLowerCase();
-        if (sibText && sibText !== 'cancel' && sibText.length < 40) {
-          console.log(`[FoxiExt-DIAG] Strategy 3 NUCLEAR: Found sibling of Cancel: <${sib.tagName}> "${sib.textContent.trim()}"`);
-          return sib;
-        }
+        const sibText = normText(sib.textContent);
+        if (!sibText || sibText.length >= 40) continue;
+        if (sibText === 'cancel' || sibText.startsWith('hide') || sibText.startsWith('please wait')) continue;
+        if (!isInViewport(sib)) continue;
+        if (DEBUG) console.log(`[FoxiExt-DIAG] Strategy 3 NUCLEAR: Found sibling of Cancel: <${sib.tagName}> "${sib.textContent.trim()}"`);
+        return sib;
       }
     }
   }
 
   // ── Diagnostic: dump what IS in the modal so we can fix the selector ──
-  console.warn('[FoxiExt] ALL STRATEGIES FAILED. Full page text (500 chars):', document.body.innerText.substring(0, 500));
-  const diagButtons = Array.from(document.querySelectorAll('button')).map(b => 
-    `<button> "${b.textContent.trim().substring(0, 50)}" [${Math.round(b.getBoundingClientRect().top)}px]`
-  );
-  const diagLinks = Array.from(document.querySelectorAll('a')).map(a => 
-    `<a> "${a.textContent.trim().substring(0, 50)}" href="${(a.href || '').substring(0, 60)}"`
-  );
-  console.warn('[FoxiExt] GO BUTTON NOT FOUND. Modal buttons:', diagButtons);
-  console.warn('[FoxiExt] GO BUTTON NOT FOUND. Modal links:', diagLinks);
-  sendMessage({ type: 'STATUS_UPDATE', status: `⚠️ GO btn missing! Buttons: ${diagButtons.join(' | ')}` });
+  if (DEBUG) {
+    const diagButtons = Array.from(root.querySelectorAll('button')).map(b => 
+      `<button> "${b.textContent.trim().substring(0, 50)}" [${Math.round(b.getBoundingClientRect().top)}px]`
+    );
+    console.warn('[FoxiExt] GO BUTTON NOT FOUND. Modal buttons:', diagButtons);
+    sendMessage({ type: 'STATUS_UPDATE', status: `⚠️ GO btn missing! Buttons: ${diagButtons.join(' | ')}` });
+  }
   
   return null;
 }
@@ -975,28 +1084,30 @@ function findErrorScreen() {
   return { button: dismissBtn, reason };
 }
 
-/** Check if the task was successfully started (timer/upload button appeared) */
-function isTaskStarted() {
-  // Method 1: Check for "TIME LEFT" text anywhere in the DOM (Inside Modal)
-  const allText = document.body.innerText;
-  if (allText.includes('TIME LEFT')) return true;
+/** Check if the task was successfully started (timer/upload button appeared).
+ *  @param {object|null} before - snapshotStartedMarkers() taken BEFORE clicking START.
+ *  Markers that already existed then belong to a previously started task (its 30s
+ *  timer card stays mounted), so only NEW markers count as this task starting. */
+function isTaskStarted(before = null) {
+  // Method 1: "TIME LEFT" — require MORE occurrences than before
+  const timeLeftCount = (document.body.innerText.match(/TIME LEFT/gi) || []).length;
+  if (timeLeftCount > (before ? before.timeLeft : 0)) return true;
 
-  // Method 2: Check for "Upload Screenshot" button (Inside Modal)
-  const uploadBtn = findElementByText('button, div, span', 'Upload Screenshot');
-  if (uploadBtn) return true;
+  // Method 2: a NEW "Upload Screenshot" element, on-screen
+  const uploads = findAllElementsByText('button, div, span', 'Upload Screenshot');
+  if (uploads.some(el => isInViewport(el) && !(before && before.upload.has(el)))) return true;
 
-  // Method 3: Check for "COPY LINK" or "VERIFY" buttons (post-start UI)
-  const copyBtn = findElementByText('button', 'copy link');
-  if (copyBtn) return true;
+  // Method 3: a NEW "Copy Link" button, on-screen (post-start UI)
+  const copyBtns = findAllElementsByText('button', 'copy link');
+  if (copyBtns.some(el => isInViewport(el) && !(before && before.copyLink.has(el)))) return true;
 
   // Method 4: Check if the task's button changed to "CONTINUE" in the main list
-  // BUT only if the modal has actually closed (no Cancel button visible).
-  // Without this guard, CONTINUE buttons from OTHER already-started tasks cause false positives.
-  const cancelBtn = findElementByText('button', 'cancel');
+  // BUT only if the modal has actually closed (no Cancel button visible), and only
+  // for a CONTINUE that wasn't already there — other started tasks also show one.
+  const cancelBtn = findAllElementsByText('button', 'cancel').find(isInViewport);
   if (!cancelBtn) {
-    // Modal appears to be closed — safe to check the list
-    const continueBtn = findElementByText('button', 'continue');
-    if (continueBtn) return true;
+    const continues = findAllElementsByText('button', 'continue');
+    if (continues.some(el => !(before && before.continues.has(el)))) return true;
   }
 
   return false;
@@ -1082,60 +1193,220 @@ function waitForCondition(checkFn, interval, timeout) {
   });
 }
 
-/** Fetch exact drip schedule for a task and schedule a precision snipe.
- *  The actual fetch is routed through background.js (service worker) to avoid
- *  CORS errors and CSP violation reports that could expose the extension. */
-async function fetchDripSchedule(taskId, taskTitle) {
+// ─── Drip Snipe Persistence ──────────────────────────────────────────────────
+
+/** Load the persisted attempt counters and permanent blocklist. */
+async function loadDripState() {
   try {
-    // Request the drip schedule via background.js (invisible to page context)
-    const data = await new Promise(resolve => {
-      chrome.runtime.sendMessage({ type: 'FETCH_DRIP_SCHEDULE', taskId }, resolve);
-    });
-    
-    if (!data || !data.schedule) return;
-    
-    const schedule = data.schedule;
+    const data = await chrome.storage.local.get(['dripState']);
+    const state = data.dripState || {};
+    dripAttempts = new Map(Object.entries(state.attempts || {}));
+
+    // Prune expired blocks so the list can't grow without bound
     const now = Date.now();
-    
-    // Find the first batch that drops in the future
-    let nextDrop = null;
-    for (const batch of schedule) {
-      const releaseMs = batch.releaseAt * 1000;
-      if (releaseMs > now) {
-        nextDrop = releaseMs;
-        break;
+    permaBlocked = new Map();
+    let pruned = 0;
+    for (const [taskId, info] of Object.entries(state.blocked || {})) {
+      if (info && info.at && now - info.at > CONFIG.DRIP_BLOCK_TTL_MS) {
+        pruned++;
+        continue;
       }
+      permaBlocked.set(taskId, info);
     }
-    
-    if (nextDrop) {
-      const delayMs = nextDrop - now;
-      
-      // If the drop is more than an hour away, ignore it
-      if (delayMs > 3600000) return;
-      
-      log(`🎯 Sniper Scheduled: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s!`);
-      sendMessage({ type: 'ADD_LOG', text: `🎯 Sniper locked on: ${taskTitle} drops in ${(delayMs / 1000).toFixed(1)}s` });
-      
-      // Schedule the snipe (uses Worker timeout so it's not throttled in bg tabs)
-      workerTimeout(() => {
-        log(`🎯 Sniper triggered for ${taskTitle}! Reloading...`);
-        // Clear cooldown instantly so it's startable
-        failedTaskCooldowns.delete(taskId);
-        
-        // Trigger the exact same highly-optimized direct API refresh that Radar uses
-        chrome.runtime.sendMessage({ type: 'TRIGGER_DIRECT_REFRESH' }).catch(() => {});
-        
-        // Restart loop in aggressive mode
-        if (isEnabled && !isPaused) {
-          abortFidget = true;
-          if (scanTimer) clearTimeout(scanTimer);
-          mainLoop();
-        }
-      }, delayMs);
-    }
+    if (pruned > 0) log(`Pruned ${pruned} expired drip block(s)`);
+    if (permaBlocked.size > 0) log(`Loaded ${permaBlocked.size} permanently blocked task(s)`);
+    if (pruned > 0) saveDripState();
   } catch (e) {
-    log(`Sniper fetch failed for #${taskId}: ${e.message}`);
+    log(`Failed to load drip state: ${e.message}`);
   }
+}
+
+/** Persist attempt counters and the blocklist. */
+function saveDripState() {
+  try {
+    chrome.storage.local.set({
+      dripState: {
+        attempts: Object.fromEntries(dripAttempts),
+        blocked: Object.fromEntries(permaBlocked)
+      }
+    });
+  } catch (e) {
+    log(`Failed to save drip state: ${e.message}`);
+  }
+}
+
+/** Permanently skip a task: it burned all its attempts. */
+function blockTaskPermanently(taskId, reason) {
+  permaBlocked.set(taskId, { at: Date.now(), reason });
+  dripAttempts.delete(taskId);
+  dripRearms.delete(taskId);
+  processedTaskIds.add(taskId); // keeps findStartableTasks() filtering it this session
+  saveDripState();
+  log(`🚫 Task #${taskId} blocked permanently (${reason})`);
+  sendMessage({ type: 'ADD_LOG', text: `🚫 Task #${taskId} blocked after ${CONFIG.DRIP_MAX_ATTEMPTS} attempts` });
+}
+
+// ─── Drip Snipe Scheduling ───────────────────────────────────────────────────
+
+/** Helper to determine if a task should be completely ignored for drips. */
+function isTaskIgnored(taskId) {
+  const idStr = String(taskId);
+  if (permaBlocked.has(idStr)) return true;
+  if (processedTaskIds.has(idStr)) return true;
+  if (userSettings && userSettings.blockedTaskIds) {
+    const blockedIds = userSettings.blockedTaskIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
+    if (blockedIds.includes(idStr)) return true;
+  }
+  return false;
+}
+
+/** Ask the radar server when the next drip batch releases for these task IDs.
+ *  Radar answers from its cached dripSummary (zero extra FoxiGrow requests) and the
+ *  reply arrives asynchronously as a DRIP_INFO message. */
+async function queryDripSchedule(taskIds) {
+  const targets = (taskIds || [])
+    .filter(id => id && id !== 'unknown' && !isTaskIgnored(id));
+  if (targets.length === 0) return;
+
+  const res = await sendMessage({ type: 'DRIP_QUERY', taskIds: targets });
+  if (!res || !res.ok) {
+    log(`Drip query unavailable (${res ? res.reason : 'no response'})`);
+  }
+}
+
+/** Handle a DRIP_INFO / DRIP_SCHEDULE payload from the radar server.
+ *  Both carry { releaseAt, serverTime } plus a list of pending task IDs. */
+function handleDripInfo(msg) {
+  const releaseAt = Number(msg.releaseAt);
+  if (!releaseAt || !isFinite(releaseAt)) return;
+
+  const pending = (msg.pending || msg.questIds || []).map(String);
+
+  // Only chase tasks we're actually retrying: ones with a recorded failed attempt that
+  // haven't burned their limit. DRIP_SCHEDULE is a broadcast that repeats whenever the
+  // pending list churns, so without this filter we'd arm snipes for tasks we never tried.
+  const targets = pending.filter(id => {
+    if (isTaskIgnored(id)) return false;
+    const attempts = dripAttempts.get(id) || 0;
+    if (attempts === 0 || attempts >= CONFIG.DRIP_MAX_ATTEMPTS) return false;
+    const arms = dripRearms.get(id) || 0;
+    if (arms >= CONFIG.DRIP_MAX_REARMS) {
+      log(`Task #${id} missed ${arms} releases without a slot, dropping chase`);
+      return false;
+    }
+    return true;
+  });
+
+
+  if (targets.length === 0) return;
+
+  // Correct for local clock skew — a 2s wrong clock destroys the snipe, and we can't
+  // assume the user's machine is synced. Radar sends serverTimeMs when available; with
+  // only whole-second serverTime the raw difference carries up to 1s of truncation noise,
+  // so quantize to whole seconds. Real skew worth correcting is seconds, not milliseconds,
+  // and leaving the noise in would push the refresh as late as releaseAt + 1.9s — outside
+  // the window where slots still exist.
+  let skewMs = 0;
+  if (msg.serverTimeMs) {
+    skewMs = Date.now() - Number(msg.serverTimeMs);
+  } else if (msg.serverTime) {
+    skewMs = Math.round((Date.now() - Number(msg.serverTime) * 1000) / 1000) * 1000;
+  }
+  const targetMs = releaseAt * 1000 + skewMs;
+  const delayMs = targetMs - Date.now();
+
+  if (delayMs < -1000) return;                 // already passed
+  if (delayMs > 3600000) return;               // more than an hour out, ignore
+
+  scheduleDripSnipe(releaseAt, targetMs, targets, skewMs);
+}
+
+/** Arm a single refresh to land just after a known drip release.
+ *  Because nextReleaseAt is global (not per-task), snipes for different tasks normally
+ *  share a timestamp and coalesce into one refresh — which is also what keeps us inside
+ *  FoxiGrow's 10s refresh cooldown. */
+function scheduleDripSnipe(releaseAt, targetMs, taskIds, skewMs) {
+  // Coalesce into an existing snipe landing within the cooldown window
+  for (const [key, snipe] of scheduledSnipes) {
+    if (Math.abs(key * 1000 - releaseAt * 1000) <= CONFIG.DRIP_COALESCE_MS) {
+      const added = [];
+      taskIds.forEach(id => {
+        if (!snipe.taskIds.has(id)) { snipe.taskIds.add(id); added.push(id); }
+      });
+      if (added.length > 0) {
+        log(`🎯 Merged #${added.join(', #')} into snipe at ${new Date(key * 1000).toLocaleTimeString()} (one refresh, respects 10s cooldown)`);
+      }
+      return;
+    }
+  }
+
+  const jitter = CONFIG.DRIP_JITTER_MIN + Math.random() * CONFIG.DRIP_JITTER_VAR;
+  const preArmDelay = Math.max(0, targetMs - Date.now() - CONFIG.DRIP_PREARM_MS);
+  const fireDelay = Math.max(0, targetMs + jitter - Date.now());
+  const snipe = { taskIds: new Set(taskIds), preArmId: null, fireId: null, rearmId: null };
+  scheduledSnipes.set(releaseAt, snipe);
+
+  const secs = ((targetMs - Date.now()) / 1000).toFixed(1);
+  log(`🎯 Drip snipe armed: #${taskIds.join(', #')} releases in ${secs}s (skew ${Math.round(skewMs)}ms, jitter ${Math.round(jitter)}ms)`);
+  sendMessage({ type: 'ADD_LOG', text: `🎯 Drip snipe armed: #${taskIds.join(', #')} in ${secs}s` });
+
+  // ── T-2s: pre-arm. DOM only, zero network, zero detection surface. ──
+  snipe.preArmId = workerTimeout(() => {
+    if (!isEnabled || isPaused) return;
+    snipe.taskIds.forEach(id => failedTaskCooldowns.delete(id));
+    abortFidget = true;
+    preScrollToTasks();
+    startAggressiveRAFScan(CONFIG.DRIP_SCAN_WINDOW);
+    logDiagnostic('system', `Drip pre-arm for #${Array.from(snipe.taskIds).join(',')}`);
+  }, preArmDelay);
+
+  // ── T+jitter: exactly one refresh. Never a burst. ──
+  snipe.fireId = workerTimeout(() => {
+    if (!isEnabled || isPaused) return;
+    const ids = Array.from(snipe.taskIds);
+    ids.forEach(id => failedTaskCooldowns.delete(id));
+    log(`🎯 Drip snipe firing for #${ids.join(', #')}`);
+    sendMessage({ type: 'TRIGGER_DIRECT_REFRESH', scheduled: true, taskIds: ids });
+    if (scanTimer) clearTimeout(scanTimer);
+    if (currentState === STATE.SCANNING) mainLoop();
+  }, fireDelay);
+
+  // ── T+jitter+3s: a release may include only a subset of pending IDs, so if our task never
+  // showed up, chase the next release. This is NOT an attempt (no START was clicked), so it
+  // must not consume one of the 3 strikes — but it does consume a chase arm, which is what
+  // stops us following a task that has quietly stopped dripping. Arms are counted here, on a
+  // release that actually passed, rather than at arm time: radar re-broadcasts
+  // DRIP_SCHEDULE whenever questIds churn, so counting at arm time would burn the cap
+  // without a single release having happened. ──
+  snipe.rearmId = workerTimeout(() => {
+    scheduledSnipes.delete(releaseAt);
+    if (!isEnabled || isPaused) return;
+
+    const startableIds = new Set(findStartableTasks().map(t => t.taskId));
+    const chase = [];
+    for (const id of snipe.taskIds) {
+      if (isTaskIgnored(id)) {
+        dripRearms.delete(id);
+        continue;
+      }
+      if (startableIds.has(id)) {
+        dripRearms.delete(id); // it showed up; the chase for it is over
+        continue;
+      }
+      const arms = (dripRearms.get(id) || 0) + 1;
+      dripRearms.set(id, arms);
+      if (arms >= CONFIG.DRIP_MAX_REARMS) {
+        log(`Task #${id} missed ${arms} releases, dropping chase`);
+        continue;
+      }
+      chase.push(id);
+    }
+
+    if (chase.length > 0) {
+      log(`Release skipped #${chase.join(', #')} — re-querying next drip`);
+      queryDripSchedule(chase);
+    }
+  }, fireDelay + CONFIG.DRIP_REARM_DELAY);
 }
 
 /** Helper to manage task failure state */
@@ -1151,27 +1422,46 @@ function handleTaskFailure(taskId, errorReason, taskTitle = '') {
     } else {
       // Remove from processed so it can be retried after cooldown
       processedTaskIds.delete(taskId);
-      
-      // "Unable to Proceed" / slots full → 60s cooldown (slots don't free up quickly)
+
+      // Count this as a real attempt: START was clicked and the claim failed.
+      // Scheduled refreshes that find nothing never reach here, so they don't burn a strike.
+      const attempts = (dripAttempts.get(taskId) || 0) + 1;
+      dripAttempts.set(taskId, attempts);
+      saveDripState();
+      log(`Task #${taskId} attempt ${attempts}/${CONFIG.DRIP_MAX_ATTEMPTS}`);
+
+      if (attempts >= CONFIG.DRIP_MAX_ATTEMPTS) {
+        blockTaskPermanently(taskId, `${attempts} failed attempts`);
+        return;
+      }
+
+      // "Unable to Proceed" / slots full → 15s cooldown. A drip batch typically releases
+      // ~60s later, and the scheduled snipe clears this cooldown explicitly anyway.
       const isSlotsFullFail = errorReason.includes('Unable to Proceed') || errorReason.includes('No slots') || errorReason.includes('quota');
-      const cooldownMs = isSlotsFullFail ? 60000 : 10000;
-      const cooldownLabel = isSlotsFullFail ? '60s' : '10s';
+      const cooldownMs = isSlotsFullFail ? 15000 : 10000;
+      const cooldownLabel = isSlotsFullFail ? '15s' : '10s';
       
       failedTaskCooldowns.set(taskId, Date.now() + cooldownMs);
       log(`Task #${taskId} placed on ${cooldownLabel} cooldown (${errorReason})`);
       
-      // Try to read the exact drip schedule for a precision snipe!
-      fetchDripSchedule(taskId, taskTitle);
+      // Ask radar when this task's next batch drops so we can snipe it
+      dripRearms.delete(taskId);
+      queryDripSchedule([taskId]);
     }
   }
 }
 
-/** Extract the task URL from the modal content */
-function extractTaskUrl() {
+/** Extract the task URL from the modal content.
+ *  @param {Element|null} scope - modal container; falls back to document when absent. */
+function extractTaskUrl(scope = null) {
+  const root = scope && scope.isConnected ? scope : document;
   try {
     // Strategy 1: Find the text next to the "Copy" button
-    const elements = document.querySelectorAll('button, div, span');
-    const copyBtn = Array.from(elements).find(el => el.textContent.trim().toLowerCase() === 'copy');
+    const elements = root.querySelectorAll('button, div, span');
+    const copyBtn = Array.from(elements).find(el => {
+      const t = normText(el.textContent);
+      return t === 'copy' || t === 'copy link';
+    });
     if (copyBtn && copyBtn.parentElement) {
       const text = copyBtn.parentElement.innerText || '';
       const match = text.match(/https?:\/\/[^\s]+/);
@@ -1179,14 +1469,15 @@ function extractTaskUrl() {
     }
     
     // Strategy 1.5: Direct check for the FoxiGrow link element class
-    const linkEl = document.querySelector('.qm-link-scroll');
+    const linkEl = root.querySelector('.qm-link-scroll');
     if (linkEl) {
       const text = linkEl.textContent.trim();
       if (text.startsWith('http')) return text;
     }
     
-    // Strategy 2: Regex the whole page and grab the last URL (ignores tutorial links)
-    const urls = document.body.innerText.match(/https?:\/\/[^\s]+/g);
+    // Strategy 2: Regex the scoped text and grab the last URL (ignores tutorial links)
+    const scopeText = (root === document ? document.body.innerText : root.innerText) || '';
+    const urls = scopeText.match(/https?:\/\/[^\s]+/g);
     if (urls) {
       const filtered = urls.filter(u => !u.toLowerCase().includes('tutorial') && !u.includes('youtube.com/shorts'));
       if (filtered.length > 0) {
@@ -1213,6 +1504,14 @@ async function claimTask(task) {
   logDiagnostic(taskId, 'Claim sequence initiated');
   log(`Starting claim sequence for ${taskTitle} (ID: #${taskId})`);
 
+  // ── Step 0: Snapshot pre-existing DOM state ──
+  // A task started moments ago keeps its 30s timer card (TIME LEFT / Copy Link /
+  // Upload Screenshot) mounted in the list. Recording what already exists lets us
+  // detect THIS task's modal by identity instead of by "does a marker exist anywhere",
+  // which previously made the modal wait return true instantly against stale DOM.
+  const preCancels = new Set(findAllElementsByText('button', 'cancel'));
+  const preStartedMarkers = snapshotStartedMarkers();
+
   // ── Step 1: Click START ──
   currentState = STATE.CLICKING_START;
   
@@ -1229,12 +1528,26 @@ async function claimTask(task) {
   currentState = STATE.CLAIMING;
   await humanClick(button);
 
-  // ── Step 2: Wait for modal to appear ──
+  // ── Step 2: Wait for THIS task's modal to appear ──
+  // Identity-based: we require a Cancel button that did NOT exist before the click.
+  // Stale DOM can never satisfy this, so we no longer race ahead at 0ms.
+  // Polling is unchanged (10ms in competitive mode), so a fast modal costs no extra delay.
   currentState = STATE.WAITING_MODAL;
   const modalTimeout = userSettings.competitiveMode ? CONFIG.COMPETITIVE_TIMEOUT : CONFIG.MODAL_WAIT_TIMEOUT;
   const pollInterval = userSettings.competitiveMode ? CONFIG.COMPETITIVE_POLL_INTERVAL : CONFIG.MODAL_WAIT_INTERVAL;
+  
+  let modalContainer = null;
+  const modalWaitStart = Date.now();
   const modalAppeared = await waitForCondition(
-    () => isModalOpen(),
+    () => {
+      const freshCancel = findAllElementsByText('button', 'cancel')
+        .find(el => !preCancels.has(el) && isInViewport(el));
+      if (freshCancel) {
+        modalContainer = getModalContainer(freshCancel);
+        return true;
+      }
+      return false;
+    },
     pollInterval,
     modalTimeout
   );
@@ -1244,8 +1557,10 @@ async function claimTask(task) {
     consecutiveErrors++;
     handleTaskFailure(taskId, 'modal did not appear');
     await sendMessage({ type: 'TASK_FAILED', taskId, taskTitle, usdtReward: task.usdtReward, reason: 'modal did not appear' });
+    await dismissAndReturn();
     return false;
   }
+  log(`Modal for #${taskId} appeared after ${Date.now() - modalWaitStart}ms`);
 
   // ── Step 3: Wait for GO ACTION button to render and click it ──
   currentState = STATE.CLICKING_GO;
@@ -1255,7 +1570,12 @@ async function claimTask(task) {
   let goButton = null;
   const goButtonAppeared = await waitForCondition(
     () => {
-      goButton = findGoActionButton();
+      // Re-resolve the container each poll: React may replace the subtree as it renders
+      const liveCancel = findAllElementsByText('button', 'cancel')
+        .find(el => !preCancels.has(el) && isInViewport(el));
+      if (liveCancel) modalContainer = getModalContainer(liveCancel);
+      if (!modalContainer || !modalContainer.isConnected) return false;
+      goButton = findGoActionButton(modalContainer);
       return !!goButton;
     },
     pollInterval,
@@ -1283,7 +1603,7 @@ async function claimTask(task) {
 
   // ── Wait for GO button to actually be in viewport (modal slide-up animation) ──
   const GO_VIEWPORT_POLL_MS = 30;
-  const GO_VIEWPORT_MAX_WAIT = 500;
+  const GO_VIEWPORT_MAX_WAIT = CONFIG.GO_VIEWPORT_MAX_WAIT;
   const goWaitStart = Date.now();
   let goRect = goButton.getBoundingClientRect();
   while (goRect.top < -50 || goRect.bottom > window.innerHeight + 50) {
@@ -1304,16 +1624,14 @@ async function claimTask(task) {
   
   // ── Extract Task URL (attempt 1: before GO click) ──
   let taskUrl = '';
-  // Small wait to let the modal content (including URL) render
-  await sleep(50);
-  taskUrl = extractTaskUrl();
+  taskUrl = extractTaskUrl(modalContainer);
   
   await humanClick(goButton);
   
   // ── Extract Task URL (attempt 2: after GO click, content may have rendered now) ──
   if (!taskUrl) {
     await sleep(100); // Give the page a moment to update after click
-    taskUrl = extractTaskUrl();
+    taskUrl = extractTaskUrl(modalContainer);
     if (taskUrl) {
       log(`Task URL found on second attempt (after GO click): ${taskUrl}`);
     }
@@ -1332,7 +1650,7 @@ async function claimTask(task) {
   logDiagnostic(taskId, 'Waiting for verification');
   
   while (Date.now() - checkStartTime < resultTimeout) {
-    if (isTaskStarted()) {
+    if (isTaskStarted(preStartedMarkers)) {
       started = true;
       break;
     }
@@ -1357,10 +1675,25 @@ async function claimTask(task) {
     logDiagnostic(taskId, 'Verification succeeded');
     log(`✅ Task #${taskId} started successfully!`);
     await sendMessage({ type: 'TASK_SUCCESS', taskId: task.taskId });
+
+    // Won it — clear the retry counters so a future drip starts from a clean slate
+    if (dripAttempts.has(taskId)) {
+      dripAttempts.delete(taskId);
+      dripRearms.delete(taskId);
+      saveDripState();
+    }
     
     if (task.usdtReward > 0) {
         log(`Recording reward: ${task.usdtReward} USDT`);
         await sendMessage({ type: 'RECORD_REWARD', usdtAmount: task.usdtReward });
+    }
+
+    // ── Extract Task URL (attempt 3: post-start UI is now rendered) ──
+    // The "Copy Link" element only exists in the started view, so this is the first
+    // point where the URL is reliably present in the DOM.
+    if (!taskUrl) {
+      taskUrl = extractTaskUrl(modalContainer) || extractTaskUrl();
+      if (taskUrl) log(`Task URL found on third attempt (post-start): ${taskUrl}`);
     }
 
     consecutiveErrors = 0;
@@ -1482,6 +1815,7 @@ async function mainLoop() {
       if (reloadBtn) {
         log('Clicking reload button...');
         await logStatus('Reloading tasks...');
+        lastRefreshClickAt = Date.now();
         await humanClick(reloadBtn);
         nextReloadTime = Date.now() + randomDelay(CONFIG.RELOAD_INTERVAL);
         await sleep(2000); 
@@ -1662,17 +1996,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
     sendResponse({ ok: true });
   } else if (message.type === 'RADAR_RELOAD') {
-    logDiagnostic('system', 'Radar Drop signal received');
-    log('⚡ Radar signal! Lightweight refresh + immediate scan');
+    const scheduled = !!message.scheduled;
+    logDiagnostic('system', scheduled ? 'Drip snipe refresh' : 'Radar Drop signal received');
+    log(scheduled ? '🎯 Drip snipe refresh + immediate scan' : '⚡ Radar signal! Lightweight refresh + immediate scan');
     
     // ── PHASE 1: Start scanning IMMEDIATELY (zero delay) ──
-    startAggressiveRAFScan(8000);
+    startAggressiveRAFScan(scheduled ? CONFIG.DRIP_SCAN_WINDOW : 8000);
     
-    // ── PHASE 2: Instantly click the native refresh button ──
-    const reloadBtn = findReloadButton();
-    if (reloadBtn) {
-        logDiagnostic('system', 'Radar Drop: Clicking native refresh button');
-        humanClick(reloadBtn);
+    // ── PHASE 2: Click the native refresh button, unless it's still inside FoxiGrow's
+    // client-side ~10s cooldown. In that case the native tab bounce background.js already
+    // performed is our refetch: it drives React's window-focus refetch through a different
+    // path that the disabled button doesn't gate. ──
+    const sinceClick = Date.now() - lastRefreshClickAt;
+    if (sinceClick >= CONFIG.DRIP_REFRESH_LOCK_MS) {
+      const reloadBtn = findReloadButton();
+      if (reloadBtn) {
+          logDiagnostic('system', 'Radar Drop: Clicking native refresh button');
+          lastRefreshClickAt = Date.now();
+          humanClick(reloadBtn);
+      }
+    } else {
+      log(`Refresh button locked (${Math.ceil((CONFIG.DRIP_REFRESH_LOCK_MS - sinceClick) / 1000)}s), relying on tab bounce`);
+      logDiagnostic('system', 'Refresh button on cooldown, tab bounce only');
     }
     
     // ── PHASE 3: Wait for DOM Update (Native Tab Bounce should trigger React Query) ──
@@ -1687,6 +2032,11 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       }
     }, 500);
 
+    sendResponse({ ok: true });
+  } else if (message.type === 'DRIP_SCHEDULE' || message.type === 'DRIP_INFO') {
+    // Radar published the next drip release time (or answered our targeted query)
+    logDiagnostic('system', `${message.type} releaseAt=${message.releaseAt}`);
+    handleDripInfo(message);
     sendResponse({ ok: true });
   }
   return true;
@@ -1717,6 +2067,10 @@ async function init() {
   // Load settings
   const data = await chrome.storage.local.get(['settings']);
   userSettings = data.settings || {};
+
+  // Load persisted drip attempt counters / blocklist. Must happen before the first scan:
+  // page reloads wipe in-memory state, so this is what makes the 3-strike rule stick.
+  await loadDripState();
 
   // Check if extension is enabled
   const response = await sendMessage({ type: 'GET_ENABLED' });
