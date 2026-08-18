@@ -100,6 +100,7 @@ let permaBlocked = new Map();     // taskId -> { at, reason }
 let dripRearms = new Map();       // taskId -> re-query count for the current chase
 let scheduledSnipes = new Map();  // releaseAt (sec) -> { preArmId, fireId, rearmId, taskIds:Set }
 let taskTitleCache = new Map();   // taskId -> title (for UI)
+let taskTotalSlotsCache = new Map(); // taskId -> total slots (for filtering)
 let lastRefreshClickAt = 0;       // last reload-BUTTON click (bounces are not gated)
 
 // ─── Utility Functions ──────────────────────────────────────────────────────
@@ -1283,6 +1284,11 @@ function handleDripInfo(msg) {
       taskTitleCache.set(Number(id), title);
     }
   }
+  if (msg.totals) {
+    for (const [id, total] of Object.entries(msg.totals)) {
+      taskTotalSlotsCache.set(Number(id), total);
+    }
+  }
 
   const releaseAt = Number(msg.releaseAt);
   if (!releaseAt || !isFinite(releaseAt)) return;
@@ -1466,6 +1472,15 @@ function handleTaskFailure(taskId, errorReason, taskTitle = '') {
       // "Unable to Proceed" / slots full → 15s cooldown. A drip batch typically releases
       // ~60s later, and the scheduled snipe clears this cooldown explicitly anyway.
       const isSlotsFullFail = errorReason.includes('Unable to Proceed') || errorReason.includes('No slots') || errorReason.includes('quota');
+      
+      // If we know this task has a very small total slot pool, it's not worth sniping
+      const totalSlots = taskTotalSlotsCache.get(taskId);
+      if (totalSlots !== undefined && totalSlots < 50) {
+        log(`Task #${taskId} skipped drip scheduling (Total slots: ${totalSlots} < 50)`);
+        blockTaskPermanently(taskId, `Total slots < 50 (${totalSlots})`);
+        return;
+      }
+
       const cooldownMs = isSlotsFullFail ? 15000 : 10000;
       const cooldownLabel = isSlotsFullFail ? '15s' : '10s';
       
