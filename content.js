@@ -1565,6 +1565,7 @@ async function claimTask(task) {
   logDiagnostic(taskId, 'Clicking START button');
   log(`Clicking START on task #${taskId}`);
   currentState = STATE.CLAIMING;
+  const startClickTime = Date.now();
   await humanClick(button);
 
   // ── Step 2: Wait for THIS task's modal to appear ──
@@ -1668,6 +1669,15 @@ async function claimTask(task) {
   // ── Extract Task URL (attempt 1: before GO click) ──
   let taskUrl = '';
   taskUrl = extractTaskUrl(modalContainer);
+  
+  if (userSettings.competitiveMode) {
+    const elapsedSinceStart = Date.now() - startClickTime;
+    if (elapsedSinceStart < 350) {
+      const remainingWait = 350 - elapsedSinceStart;
+      logDiagnostic(taskId, `Enforcing strict 350ms gap. Waiting ${remainingWait}ms...`);
+      await sleep(remainingWait);
+    }
+  }
   
   await humanClick(goButton);
   
