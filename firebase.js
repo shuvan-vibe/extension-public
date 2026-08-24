@@ -12,13 +12,13 @@ async function getLicense(key) {
     if (res.status === 404) return null;
     if (!res.ok) {
       console.error("Firebase getLicense error:", await res.text());
-      return null;
+      return { error: true, status: res.status };
     }
     const data = await res.json();
     return parseDocument(data);
   } catch (err) {
     console.error("Firebase getLicense error:", err);
-    return null;
+    return { error: true, network: true };
   }
 }
 

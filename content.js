@@ -47,13 +47,13 @@ const CONFIG = {
   // ── DRIP SNIPING ──
   // A drip task releases its slots in batches at server-defined timestamps. Missing a
   // batch means waiting for the next one, so we schedule a refresh to land right on it.
-  DRIP_MAX_ATTEMPTS:        3,      // real START attempts before a task is blocked forever
+  DRIP_MAX_ATTEMPTS:        1,      // real START attempts before a task is blocked forever
   DRIP_PREARM_MS:           2000,   // start the 16ms scanner this early (DOM-only, no network)
   DRIP_JITTER_MIN:          200,    // refresh fires at releaseAt + 200..900ms (never a fixed offset)
   DRIP_JITTER_VAR:          700,
   DRIP_SCAN_WINDOW:         12000,  // must cover release + the ~10s slot drain
   DRIP_REARM_DELAY:         3000,   // after a release, re-query if our task never appeared
-  DRIP_MAX_REARMS:          5,      // bound the loop when a task stops dripping entirely
+  DRIP_MAX_REARMS:          3,      // bound the loop when a task stops dripping entirely
   DRIP_COALESCE_MS:         10000,  // merge snipes landing within this window into one refresh
   DRIP_REFRESH_LOCK_MS:     10000,  // FoxiGrow's client-side refresh-button cooldown
   DRIP_BLOCK_TTL_MS:        604800000, // prune blocked entries after 7 days
@@ -344,14 +344,18 @@ async function humanClick(element) {
   const clickTs = now.toTimeString().split(' ')[0] + '.' + now.getMilliseconds().toString().padStart(3, '0');
   const elementDesc = `<${element.tagName}> "${element.textContent.trim().substring(0,30)}"`;
   
+  sendBlackboxLog(`CLICK_ATTEMPT: X=${Math.round(x)}, Y=${Math.round(y)} on ${elementDesc}. (Viewport: ${window.innerWidth}x${window.innerHeight})`);
+  
   if (stillOffScreen) {
     console.warn(`[FoxiExt-CLICK] [${clickTs}] Element off-screen at (${Math.round(x)}, ${Math.round(y)}). Using direct .click()...`);
     try {
       element.click();
+      sendBlackboxLog(`CLICK_RESULT: Off-screen fallback SUCCESS`);
       console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Off-screen .click() SUCCESS on ${elementDesc}`);
       sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (off-screen fallback) — ${elementDesc}` });
     } catch (e) {
       console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ Off-screen .click() FAILED on ${elementDesc}:`, e);
+      sendBlackboxLog(`CLICK_RESULT: Off-screen fallback FAILED - ${e.message}`);
       sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ FAILED (off-screen) — ${elementDesc}` });
     }
     return;
@@ -375,6 +379,7 @@ async function humanClick(element) {
       logDiagnostic('click', `✅ Direct click SUCCESS: ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
     } catch (err) {
       console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ COMPETITIVE click FAILED on ${elementDesc}:`, err);
+      sendBlackboxLog(`CLICK_RESULT: Competitive direct click FAILED - ${err.message}`);
       sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ FAILED (competitive) — ${elementDesc} — ${err.message}` });
       logDiagnostic('click', `❌ Direct click FAILED: ${elementDesc} — ${err.message}`);
     }
@@ -449,6 +454,15 @@ function sendMessage(message) {
 function log(msg, ...args) {
   if (DEBUG) console.log(`[FoxiExt] ${msg}`, ...args);
 }
+
+function sendBlackboxLog(text) {
+  window.__foxiBlackboxQueue = window.__foxiBlackboxQueue || [];
+  const now = new Date();
+  const ts = now.toTimeString().split(' ')[0] + '.' + now.getMilliseconds().toString().padStart(3, '0');
+  window.__foxiBlackboxQueue.push(`[${ts}] ${text}`);
+}
+
+sendBlackboxLog("BOT_STARTED: Content script injected and Blackbox Logger initialized.");
 
 function logDiagnostic(taskId, message) {
   if (userSettings.diagnosticMode) {
@@ -1301,7 +1315,7 @@ function handleDripInfo(msg) {
   const targets = pending.filter(id => {
     if (isTaskIgnored(id)) return false;
     const attempts = dripAttempts.get(id) || 0;
-    if (attempts === 0 || attempts >= CONFIG.DRIP_MAX_ATTEMPTS) return false;
+    if (attempts >= CONFIG.DRIP_MAX_ATTEMPTS) return false;
     const arms = dripRearms.get(id) || 0;
     if (arms >= CONFIG.DRIP_MAX_REARMS) {
       log(`Task #${id} missed ${arms} releases without a slot, dropping chase`);
@@ -1380,7 +1394,7 @@ function scheduleDripSnipe(releaseAt, targetMs, taskIds, skewMs) {
     const ids = Array.from(snipe.taskIds);
     ids.forEach(id => failedTaskCooldowns.delete(id));
     log(`🎯 Drip snipe firing for #${ids.join(', #')}`);
-    sendMessage({ type: 'TRIGGER_DIRECT_REFRESH', scheduled: true, taskIds: ids });
+    // sendMessage({ type: 'TRIGGER_DIRECT_REFRESH', scheduled: true, taskIds: ids });
     if (scanTimer) clearTimeout(scanTimer);
     if (currentState === STATE.SCANNING) mainLoop();
     broadcastSnipes();
@@ -1481,8 +1495,10 @@ function handleTaskFailure(taskId, errorReason, taskTitle = '') {
         return;
       }
 
-      const cooldownMs = isSlotsFullFail ? 15000 : 10000;
-      const cooldownLabel = isSlotsFullFail ? '15s' : '10s';
+      const cooldownMs = 30000;
+      const cooldownLabel = '30s';
+      
+      sendBlackboxLog(`TASK_FAILED: ID=${taskId}, Reason="${errorReason}", Cooldown=30s`);
       
       failedTaskCooldowns.set(taskId, Date.now() + cooldownMs);
       log(`Task #${taskId} placed on ${cooldownLabel} cooldown (${errorReason})`);
@@ -1545,6 +1561,7 @@ async function claimTask(task) {
   }
 
   logDiagnostic(taskId, 'Claim sequence initiated');
+  sendBlackboxLog(`TASK_STARTING: ID=${taskId}, Title="${taskTitle}", Element="${button.textContent.trim().substring(0,25)}"`);
   log(`Starting claim sequence for ${taskTitle} (ID: #${taskId})`);
 
   // ── Step 0: Snapshot pre-existing DOM state ──
@@ -1619,6 +1636,9 @@ async function claimTask(task) {
       if (liveCancel) modalContainer = getModalContainer(liveCancel);
       if (!modalContainer || !modalContainer.isConnected) return false;
       goButton = findGoActionButton(modalContainer);
+      if (goButton && goButton.textContent.toLowerCase().includes('loading')) {
+        return false; // Wait until it finishes loading
+      }
       return !!goButton;
     },
     pollInterval,
@@ -1649,7 +1669,8 @@ async function claimTask(task) {
   const GO_VIEWPORT_MAX_WAIT = CONFIG.GO_VIEWPORT_MAX_WAIT;
   const goWaitStart = Date.now();
   let goRect = goButton.getBoundingClientRect();
-  while (goRect.top < -50 || goRect.bottom > window.innerHeight + 50) {
+  // Wait until the bottom is fully visible in the viewport so humanClick() doesn't fall back to synthetic .click()
+  while (goRect.top < 0 || goRect.bottom > window.innerHeight) {
     if (Date.now() - goWaitStart > GO_VIEWPORT_MAX_WAIT) {
       console.warn(`[FoxiExt] GO button still off-screen after ${GO_VIEWPORT_MAX_WAIT}ms (top=${Math.round(goRect.top)}), proceeding anyway`);
       break;
@@ -1887,9 +1908,11 @@ async function mainLoop() {
 
   // After claiming, immediately scan for more (don't wait for the full interval)
   if (userSettings.competitiveMode) {
-    await sleep(350); // 350ms delay between consecutive tasks to avoid triggering server-side flood limits
+    await sleep(500); // Strict 500ms minimum delay between consecutive tasks
   } else {
-    await sleep(humanDelay(CONFIG.DELAY_BEFORE_NEXT_SCAN));
+    // Ensure delay is at least 500ms even with random variation
+    const delay = Math.max(500, humanDelay(CONFIG.DELAY_BEFORE_NEXT_SCAN));
+    await sleep(delay);
   }
   
   if (isEnabled && !isPaused) {
@@ -2077,9 +2100,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     sendResponse({ ok: true });
   } else if (message.type === 'DRIP_SCHEDULE' || message.type === 'DRIP_INFO') {
-    // Radar published the next drip release time (or answered our targeted query)
-    logDiagnostic('system', `${message.type} releaseAt=${message.releaseAt}`);
-    handleDripInfo(message);
+    // Drip tasks are no longer refreshed, only new tasks.
     sendResponse({ ok: true });
   } else if (message.type === 'CANCEL_SNIPE') {
     const idToCancel = message.taskId;

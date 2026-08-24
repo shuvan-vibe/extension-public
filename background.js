@@ -341,11 +341,19 @@ async function verifyLicenseInBackground() {
   if (data.licenseKey === 'ADMIN-PERMANENT-KEY') return true;
   
   if (typeof globalThis.FirebaseApi === 'undefined') return false;
-  const license = await globalThis.FirebaseApi.getLicense(data.licenseKey);
-  if (license && license.active && license.expiresAt > Date.now()) {
-      if (!license.deviceId || license.deviceId === data.deviceId) {
-          return true;
-      }
+  try {
+    const license = await globalThis.FirebaseApi.getLicense(data.licenseKey);
+    if (license && license.error) {
+      // Network error, assume valid for now to avoid stopping bot during brief disconnects
+      return true;
+    }
+    if (license && license.active && license.expiresAt > Date.now()) {
+        if (!license.deviceId || license.deviceId === data.deviceId) {
+            return true;
+        }
+    }
+  } catch (e) {
+    return true; // Fail open on unexpected errors during background check
   }
   // Invalidate the popup's 24h auth cache so it stops showing the dashboard
   chrome.storage.local.remove('lastAuthCheck');
@@ -353,7 +361,11 @@ async function verifyLicenseInBackground() {
 }
 
 // Check license every 30 minutes
-chrome.alarms.create('license-check', { periodInMinutes: 30 });
+chrome.alarms.get('license-check', (alarm) => {
+  if (!alarm) {
+    chrome.alarms.create('license-check', { periodInMinutes: 30 });
+  }
+});
 
 // Handle alarm firing
 chrome.alarms.onAlarm.addListener(async (alarm) => {
@@ -381,7 +393,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
     return;
   }
 
-  if (alarm.name === ALARM_NAME && isEnabled && !isPaused) {
+  if (alarm.name === ALARM_NAME && isEnabled) {
     console.log('[FoxiExt-BG] Auth refresh alarm fired');
     addToLog('⏰ Auth refresh alarm fired');
     
@@ -402,6 +414,7 @@ chrome.alarms.onAlarm.addListener(async (alarm) => {
       return;
     }
     
+    // Refresh auth even if paused, to preserve the session
     startLaunchFlow();
   }
 });
@@ -522,7 +535,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
     case 'CANCEL_SNIPE':
       if (foxigrowTabId) {
-        chrome.tabs.sendMessage(foxigrowTabId, { type: 'CANCEL_SNIPE', taskId: message.taskId });
+        chrome.tabs.sendMessage(foxigrowTabId, { type: 'CANCEL_SNIPE', taskId: message.taskId }).catch(() => {});
       }
       sendResponse({ ok: true });
       break;
@@ -675,12 +688,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         chrome.storage.local.get(['settings'], (data) => {
           const s = data.settings || {};
           // Clean dynamic text to prevent Telegram HTML parsing errors
-          const cleanTG = (str) => (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const cleanTG = (str) => (String(str) || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           const title = cleanTG(message.taskTitle) || `Task #${message.taskId}`;
           
           // Use intercepted URL from the API claim response (100% accurate)
           // Fall back to the DOM-scraped URL from content.js if missing
-          const url = interceptedTaskUrls.get(message.taskId) || message.taskUrl || 'No URL';
+          const url = interceptedTaskUrls.get(String(message.taskId)) || message.taskUrl || 'No URL';
           
           // Chrome Notification
           if (s.chromeNotif !== false) {
@@ -700,6 +713,20 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             const text = `🚀 <b>FoxiGrow Task Started!</b>\n\n<b>Task ID:</b> #${safeTaskId}\n<b>Title:</b> ${title}${usdtText}\n<b>Link:</b> ${url}`;
             sendTelegramMessage(text);
           }
+
+          // ScamExposureBot Webhook
+          fetch('http://127.0.0.1:3333/task', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              id: message.taskId,
+              title: message.taskTitle,
+              link: url,
+              totalCount: message.totalCount || 0
+            })
+          }).catch(() => {
+            // Silently ignore if ScamExposureBot is not running
+          });
         });
       }, 500);
 
@@ -724,7 +751,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.storage.local.get('settings', (data) => {
         const s = data.settings || {};
         if (s.tgNotif && s.tgTaskFailed !== false) {
-          const cleanTG = (str) => (str || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+          const cleanTG = (str) => (String(str) || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
           const safeTaskId = cleanTG(message.taskId);
           const title = cleanTG(message.taskTitle) || `Task #${safeTaskId}`;
           const usdtText = message.usdtReward ? `\n<b>Reward:</b> +${message.usdtReward} USDT` : '';
