@@ -944,14 +944,13 @@ async function simulateHumanClick(tabId, x, y, fast = false) {
   const settleDelay = 10 + Math.random() * 20; // 10-30ms
   await new Promise(r => setTimeout(r, settleDelay));
 
-  // Press and release with realistic hold duration (faster tap)
+  // Press and release ATOMICALLY.
+  // We do not await a delay here because any page scrolling, layout shifts,
+  // or physical mouse movements during the hold delay can cause FoxiGrow's 
+  // touch-listeners to interpret the click as a "swipe to hide" drag gesture!
   await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mousePressed', button: 'left', clickCount: 1, x: finalX, y: finalY
   });
-  
-  const holdDelay = 15 + Math.random() * 25; // 15-40ms hold
-  await new Promise(r => setTimeout(r, holdDelay));
-  
   await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mouseReleased', button: 'left', clickCount: 1, x: finalX, y: finalY
   });
