@@ -179,28 +179,31 @@ function connectRadar(url) {
     radarWs.onmessage = (event) => {
       try {
         const msg = JSON.parse(event.data);
+        let isBrandNewTask = false;
         if (msg.taskId) {
-           radarHighestId = Math.max(radarHighestId, parseInt(msg.taskId, 10) || 0);
+           const tid = parseInt(msg.taskId, 10) || 0;
+           if (tid > radarHighestId) {
+             isBrandNewTask = true;
+           }
+           radarHighestId = Math.max(radarHighestId, tid);
         }
+        
         if (msg.type === 'TASK_DROP') {
           console.log('[FoxiExt-BG] RADAR SIGNAL RECEIVED:', msg);
 
-          // Exactly two things may cause a DOM refresh:
-          //   1. a BRAND-NEW task appearing (this path, unchanged from before)
-          //   2. a scheduled snipe for a task we already tried and lost
-          //      (content.js → TRIGGER_DIRECT_REFRESH with scheduled: true)
-          //
-          // A drip-batch release carries a taskId and is deliberately NOT refreshed here.
-          // Radar announces every drip release, including tasks we never attempted, so
-          // refreshing on it would add traffic for tasks we aren't chasing. The tasks we
-          // ARE chasing are already covered by their own scheduled snipe, which is timed
-          // off releaseAt instead of reacting after the fact.
-          if (msg.taskId) {
-            console.log(`[FoxiExt-BG] Drip release for #${msg.taskId} — no refresh (snipe handles chased tasks)`);
+          // We trigger a DOM refresh if:
+          // 1. The signal has NO taskId (legacy global drop)
+          // 2. The signal HAS a taskId, but it's HIGHER than any task we've ever seen (Brand New Task!)
+          // If it has a taskId we've seen before, it's just a recurring drip batch and we let the sniper handle it.
+          const shouldRefresh = !msg.taskId || isBrandNewTask;
+
+          if (!shouldRefresh) {
+            console.log(`[FoxiExt-BG] Drip release for #${msg.taskId} — no refresh (sniper handles chased tasks)`);
           } else if (isEnabled && !isPaused && foxigrowTabId) {
             const now = Date.now();
             if (now - lastRadarReloadTime >= 12000) {
               lastRadarReloadTime = now;
+              console.log(`[FoxiExt-BG] ${isBrandNewTask ? 'BRAND NEW TASK' : 'GLOBAL DROP'} detected! Refreshing DOM...`);
               triggerRadarRefresh();
             } else {
               const waitSec = Math.ceil((12000 - (now - lastRadarReloadTime)) / 1000);
