@@ -715,7 +715,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           }
 
           // ScamExposureBot Webhook
-          fetch('http://127.0.0.1:3333/task', {
+          fetch('https://expose-service-production.up.railway.app/task', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -725,7 +725,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
               totalCount: message.totalCount || 0
             })
           }).catch(() => {
-            // Silently ignore if ScamExposureBot is not running
+            // Silently ignore if ScamExposureBot is not running or unreachable
           });
         });
       }, 500);
