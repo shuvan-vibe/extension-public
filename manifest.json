@@ -11,7 +11,8 @@
     "debugger"
   ],
   "host_permissions": [
-    "https://polling-production-db64.up.railway.app/*"
+    "https://polling-production-db64.up.railway.app/*",
+    "https://expose-service-production.up.railway.app/*"
   ],
   "background": {
     "service_worker": "background.js"
