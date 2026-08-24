@@ -361,82 +361,61 @@ async function humanClick(element) {
     return;
   }
   
-  if (isFast) {
-    // ── COMPETITIVE MODE: Direct click (100% reliable, no debugger dependency) ──
-    console.log(`[FoxiExt-CLICK] [${clickTs}] COMPETITIVE direct click on ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
-    
-    try {
-      // Fire a realistic pointer + mouse event chain before .click() for slightly more realism
+  // ── FIRE CLICK ──
+  console.log(`[FoxiExt-CLICK] [${clickTs}] ${isFast ? 'COMPETITIVE' : 'NON-COMPETITIVE'} click on ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+  
+  try {
+    // Both modes now use chrome.debugger to guarantee isTrusted=true.
+    // Competitive mode passes fast=true to bypass delays and teleport the cursor instantly.
+    const response = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: isFast });
+    if (response && response.error) {
+      // Debugger failed — try reattach + retry
+      console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger FAILED: ${response.error}. Trying reattach...`);
+      const reattach = await sendMessage({ type: 'REATTACH_DEBUGGER' });
+      if (reattach && reattach.ok) {
+        await sleep(100);
+        const retry = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: isFast });
+        if (retry && !retry.error) {
+          console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS (after reattach) on ${elementDesc}`);
+          sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger reattach${isFast ? ' - fast' : ''}) — ${elementDesc}` });
+          logDiagnostic('click', `✅ Debugger click SUCCESS (reattach): ${elementDesc}`);
+          return;
+        }
+      }
+      
+      // Debugger completely failed — fall back to direct .click() (WARNING: May trigger risk control)
+      console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger unavailable. Falling back to direct .click()...`);
       const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
       element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
       element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
       element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
       element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
       element.click();
-      
-      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ COMPETITIVE click SUCCESS on ${elementDesc}`);
-      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (competitive/direct) — ${elementDesc}` });
-      logDiagnostic('click', `✅ Direct click SUCCESS: ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
-    } catch (err) {
-      console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ COMPETITIVE click FAILED on ${elementDesc}:`, err);
-      sendBlackboxLog(`CLICK_RESULT: Competitive direct click FAILED - ${err.message}`);
-      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ FAILED (competitive) — ${elementDesc} — ${err.message}` });
-      logDiagnostic('click', `❌ Direct click FAILED: ${elementDesc} — ${err.message}`);
+      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger failed → .click() fallback) — ${elementDesc}` });
+      logDiagnostic('click', `⚠️ Debugger failed, used .click() fallback: ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+    } else {
+      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS on ${elementDesc}`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger${isFast ? ' - fast' : ''}) — ${elementDesc}` });
+      logDiagnostic('click', `✅ Debugger click SUCCESS: ${elementDesc}`);
     }
-  } else {
-    // ── NON-COMPETITIVE MODE: Debugger click (stealthy) with .click() fallback ──
-    console.log(`[FoxiExt-CLICK] [${clickTs}] Debugger click on ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
-    
+  } catch (err) {
+    // Debugger threw — fall back to direct .click()
+    console.error(`[FoxiExt-CLICK] [${clickTs}] Debugger THREW: ${err.message}. Falling back to .click()...`);
     try {
-      const response = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: false });
-      if (response && response.error) {
-        // Debugger failed — try reattach + retry
-        console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger FAILED: ${response.error}. Trying reattach...`);
-        const reattach = await sendMessage({ type: 'REATTACH_DEBUGGER' });
-        if (reattach && reattach.ok) {
-          await sleep(100);
-          const retry = await sendMessage({ type: 'SIMULATE_CLICK', x, y, fast: false });
-          if (retry && !retry.error) {
-            console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS (after reattach) on ${elementDesc}`);
-            sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger reattach) — ${elementDesc}` });
-            logDiagnostic('click', `✅ Debugger click SUCCESS (reattach): ${elementDesc}`);
-            return;
-          }
-        }
-        // Debugger completely failed — fall back to direct .click() instead of aborting
-        console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger unavailable. Falling back to direct .click()...`);
-        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-        element.click();
-        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
-        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger failed → .click() fallback) — ${elementDesc}` });
-        logDiagnostic('click', `⚠️ Debugger failed, used .click() fallback: ${elementDesc}`);
-      } else {
-        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS on ${elementDesc}`);
-        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger) — ${elementDesc}` });
-        logDiagnostic('click', `✅ Debugger click SUCCESS: ${elementDesc}`);
-      }
-    } catch (err) {
-      // Debugger threw — fall back to direct .click()
-      console.error(`[FoxiExt-CLICK] [${clickTs}] Debugger THREW: ${err.message}. Falling back to .click()...`);
-      try {
-        const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-        element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-        element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-        element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-        element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-        element.click();
-        console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
-        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger threw → .click() fallback) — ${elementDesc}` });
-        logDiagnostic('click', `⚠️ Debugger threw, used .click() fallback: ${elementDesc}`);
-      } catch (fallbackErr) {
-        console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ ALL click methods FAILED on ${elementDesc}:`, fallbackErr);
-        sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ALL METHODS FAILED — ${elementDesc}` });
-        logDiagnostic('click', `❌ ALL click methods FAILED: ${elementDesc} — ${fallbackErr.message}`);
-      }
+      const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
+      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
+      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
+      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
+      element.click();
+      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger threw → .click() fallback) — ${elementDesc}` });
+      logDiagnostic('click', `⚠️ Debugger threw, used .click() fallback: ${elementDesc}`);
+    } catch (fallbackErr) {
+      console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ ALL click methods FAILED on ${elementDesc}:`, fallbackErr);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ALL METHODS FAILED — ${elementDesc}` });
+      logDiagnostic('click', `❌ ALL click methods FAILED: ${elementDesc} — ${fallbackErr.message}`);
     }
   }
 }
