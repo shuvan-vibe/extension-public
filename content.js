@@ -15,9 +15,9 @@ const DEBUG = true; // TEMPORARY: enabled for GO button diagnosis
 
 const CONFIG = {
   // ── NON-COMPETITIVE (Human-like but fast enough to ensure <1000ms GO click) ──
-  DELAY_BEFORE_START_CLICK:  280,    // median ms — fast human reflex
-  DELAY_BEFORE_GO_CLICK:     100,    // median ms — quick, habitual click
-  DELAY_BEFORE_NEXT_SCAN:    400,    // median ms — short pause before moving on
+  DELAY_BEFORE_START_CLICK:  100,    // median ms — faster human reflex
+  DELAY_BEFORE_GO_CLICK:     50,     // median ms — quick, habitual click
+  DELAY_BEFORE_NEXT_SCAN:    150,    // median ms — short pause before moving on
   
   // ── AGGRESSIVE COMPETITIVE (fastest safe limit) ──
   COMPETITIVE_START_CLICK:   10,     // Instant Twitch reflex

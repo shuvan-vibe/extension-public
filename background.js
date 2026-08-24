@@ -924,8 +924,8 @@ async function simulateHumanClick(tabId, x, y, fast = false) {
     return;
   }
 
-  // Move along quadratic Bézier curve
-  const steps = 8 + Math.floor(Math.random() * 8);
+  // Move along quadratic Bézier curve (Faster steps)
+  const steps = 4 + Math.floor(Math.random() * 4); // 4-7 steps
   for (let i = 0; i <= steps; i++) {
     const t = i / steps;
     const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
@@ -936,20 +936,20 @@ async function simulateHumanClick(tabId, x, y, fast = false) {
       type: 'mouseMoved', x: Math.round(mx), y: Math.round(my)
     });
     
-    const stepDelay = 15 + Math.random() * 25;
+    const stepDelay = 5 + Math.random() * 10; // 5-15ms per step
     await new Promise(r => setTimeout(r, stepDelay));
   }
 
-  // Small settle pause (human hand steadying)
-  const settleDelay = 30 + Math.random() * 70;
+  // Small settle pause (human hand steadying - faster)
+  const settleDelay = 10 + Math.random() * 20; // 10-30ms
   await new Promise(r => setTimeout(r, settleDelay));
 
-  // Press and release with realistic hold duration
+  // Press and release with realistic hold duration (faster tap)
   await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
     type: 'mousePressed', button: 'left', clickCount: 1, x: finalX, y: finalY
   });
   
-  const holdDelay = 60 + Math.random() * 90;
+  const holdDelay = 15 + Math.random() * 25; // 15-40ms hold
   await new Promise(r => setTimeout(r, holdDelay));
   
   await chrome.debugger.sendCommand(target, 'Input.dispatchMouseEvent', {
