@@ -34,6 +34,7 @@ const snipesContainer = document.getElementById('snipesContainer');
 const noSnipesMsg = document.getElementById('noSnipesMsg');
 
 // Settings Inputs
+const priorityKeywordsInput = document.getElementById('priorityKeywordsInput');
 const blockedKeywordsInput = document.getElementById('blockedKeywordsInput');
 const blockedTaskIdsInput = document.getElementById('blockedTaskIdsInput');
 const tgBotTokenInput = document.getElementById('tgBotTokenInput');
@@ -145,6 +146,7 @@ async function init() {
   // Load settings
   chrome.storage.local.get(['settings'], (data) => {
     const s = data.settings || {};
+    priorityKeywordsInput.value = s.priorityKeywords || '';
     blockedKeywordsInput.value = s.blockedKeywords || '';
     blockedTaskIdsInput.value = s.blockedTaskIds || '';
     tgBotTokenInput.value = s.tgBotToken || '';
@@ -343,6 +345,7 @@ function refreshDripBlocked() {
 
 function saveSettings() {
   const settings = {
+    priorityKeywords: priorityKeywordsInput.value,
     blockedKeywords: blockedKeywordsInput.value,
     blockedTaskIds: blockedTaskIdsInput.value,
     tgBotToken: tgBotTokenInput.value,

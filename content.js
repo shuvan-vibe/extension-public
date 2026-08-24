@@ -778,7 +778,7 @@ function findStartableTasks() {
       .filter(id => id.length > 0);
   }
 
-  return tasks.filter(task => {
+  const filteredTasks = tasks.filter(task => {
     // Only click START buttons
     if (task.buttonText !== 'start') return false;
 
@@ -818,6 +818,30 @@ function findStartableTasks() {
     
     return true;
   });
+
+  // Parse priority keywords
+  let priorityKeywords = [];
+  if (userSettings.priorityKeywords) {
+    priorityKeywords = userSettings.priorityKeywords.split(',')
+      .map(k => k.trim().toLowerCase())
+      .filter(k => k.length > 0);
+  }
+
+  // Sort so priority tasks come first
+  if (priorityKeywords.length > 0) {
+    filteredTasks.sort((a, b) => {
+      const textA = a.element.textContent.toLowerCase();
+      const textB = b.element.textContent.toLowerCase();
+      const aPriority = priorityKeywords.some(kw => textA.includes(kw));
+      const bPriority = priorityKeywords.some(kw => textB.includes(kw));
+      
+      if (aPriority && !bPriority) return -1;
+      if (!aPriority && bPriority) return 1;
+      return 0;
+    });
+  }
+
+  return filteredTasks;
 }
 
 // ─── Modal Detection ─────────────────────────────────────────────────────────
