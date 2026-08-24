@@ -810,14 +810,17 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       return true;
 
     case 'ADD_DIAGNOSTIC_LOG':
+      const now = Date.now();
       diagnosticLogs.push({
-        timestamp: Date.now(),
+        timestamp: now,
         message: message.text,
         taskId: message.taskId || 'system'
       });
-      // Keep only last 500 logs to prevent memory leak
-      if (diagnosticLogs.length > 500) {
-        diagnosticLogs.shift();
+      // Keep logs for 1 hour, hard cap at 20,000 lines to protect memory
+      const oneHourAgo = now - 3600000;
+      diagnosticLogs = diagnosticLogs.filter(log => log.timestamp > oneHourAgo);
+      if (diagnosticLogs.length > 20000) {
+        diagnosticLogs = diagnosticLogs.slice(-20000);
       }
       sendResponse({ ok: true });
       break;
