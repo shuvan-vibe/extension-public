@@ -166,6 +166,7 @@ function connectRadar(url) {
       radarConnected = true;
       console.log('[FoxiExt-BG] Radar WS Connected');
       addToLog('📡 Radar Server Connected');
+      radarWs.send(JSON.stringify({ type: 'STATUS', isEnabled }));
       
       // Keep WebSocket alive with a periodic ping to prevent reverse proxy idle timeouts (e.g. Cloudflare/Railway)
       if (radarPingTimer) clearInterval(radarPingTimer);
@@ -584,6 +585,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       
       // Notify content scripts
       broadcastToContentScripts({ type: 'STATE_CHANGED', isEnabled, isPaused });
+      if (radarWs && radarWs.readyState === WebSocket.OPEN) {
+        radarWs.send(JSON.stringify({ type: 'STATUS', isEnabled }));
+      }
       sendResponse({ isEnabled, isPaused });
       break;
 
@@ -611,6 +615,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
       // Notify content scripts just in case
       broadcastToContentScripts({ type: 'STATE_CHANGED', isEnabled, isPaused });
+      if (radarWs && radarWs.readyState === WebSocket.OPEN) {
+        radarWs.send(JSON.stringify({ type: 'STATUS', isEnabled }));
+      }
       sendResponse({ isEnabled, isPaused });
       break;
 
