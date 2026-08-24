@@ -106,6 +106,7 @@ chrome.storage.local.get(['isEnabled', 'isPaused', 'stats', 'settings'], (data) 
 // ─── Radar Server (WebSocket) ────────────────────────────────────────────────
 let radarWs = null;
 let radarReconnectTimer = null;
+let radarPingTimer = null;
 let radarConnected = false;
 let radarHighestId = 0;
 let lastRadarReloadTime = 0;
@@ -165,6 +166,14 @@ function connectRadar(url) {
       radarConnected = true;
       console.log('[FoxiExt-BG] Radar WS Connected');
       addToLog('📡 Radar Server Connected');
+      
+      // Keep WebSocket alive with a periodic ping to prevent reverse proxy idle timeouts (e.g. Cloudflare/Railway)
+      if (radarPingTimer) clearInterval(radarPingTimer);
+      radarPingTimer = setInterval(() => {
+        if (radarWs && radarWs.readyState === WebSocket.OPEN) {
+          radarWs.send(JSON.stringify({ type: 'PING' }));
+        }
+      }, 25000); // 25s is safe for most 30s/55s load balancer timeouts
     };
 
     radarWs.onmessage = (event) => {
@@ -212,12 +221,14 @@ function connectRadar(url) {
     };
 
     radarWs.onclose = () => {
+      if (radarPingTimer) clearInterval(radarPingTimer);
       radarConnected = false;
       console.log('[FoxiExt-BG] Radar WS Disconnected');
       radarReconnectTimer = setTimeout(() => connectRadar(url), 5000); // Reconnect in 5s
     };
 
     radarWs.onerror = (error) => {
+      if (radarPingTimer) clearInterval(radarPingTimer);
       radarConnected = false;
       console.error('[FoxiExt-BG] Radar WS Error:', error);
     };
