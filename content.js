@@ -383,40 +383,24 @@ async function humanClick(element) {
         }
       }
       
-      // Debugger completely failed — fall back to direct .click() (WARNING: May trigger risk control)
-      console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger unavailable. Falling back to direct .click()...`);
-      const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-      element.click();
-      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
-      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger failed → .click() fallback) — ${elementDesc}` });
-      logDiagnostic('click', `⚠️ Debugger failed, used .click() fallback: ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+      // Debugger completely failed — ABORT to protect the account from risk control.
+      // We no longer fall back to direct .click() because it sends an untrusted synthetic event
+      // that gets flagged by FoxiGrow's anti-cheat.
+      console.warn(`[FoxiExt-CLICK] [${clickTs}] Debugger unavailable. ABORTING click to prevent risk control penalty!`);
+      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ABORTED (Debugger unavailable)` });
+      logDiagnostic('click', `❌ Click ABORTED to protect account (Debugger failed): ${elementDesc} at (${Math.round(x)}, ${Math.round(y)})`);
+      throw new Error("Debugger click failed and fallback is disabled for safety.");
     } else {
       console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Debugger click SUCCESS on ${elementDesc}`);
       sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger${isFast ? ' - fast' : ''}) — ${elementDesc}` });
       logDiagnostic('click', `✅ Debugger click SUCCESS: ${elementDesc}`);
     }
   } catch (err) {
-    // Debugger threw — fall back to direct .click()
-    console.error(`[FoxiExt-CLICK] [${clickTs}] Debugger THREW: ${err.message}. Falling back to .click()...`);
-    try {
-      const eventOpts = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
-      element.dispatchEvent(new PointerEvent('pointerdown', eventOpts));
-      element.dispatchEvent(new MouseEvent('mousedown', eventOpts));
-      element.dispatchEvent(new PointerEvent('pointerup', eventOpts));
-      element.dispatchEvent(new MouseEvent('mouseup', eventOpts));
-      element.click();
-      console.log(`[FoxiExt-CLICK] [${clickTs}] ✅ Fallback .click() SUCCESS on ${elementDesc}`);
-      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ✅ (debugger threw → .click() fallback) — ${elementDesc}` });
-      logDiagnostic('click', `⚠️ Debugger threw, used .click() fallback: ${elementDesc}`);
-    } catch (fallbackErr) {
-      console.error(`[FoxiExt-CLICK] [${clickTs}] ❌ ALL click methods FAILED on ${elementDesc}:`, fallbackErr);
-      sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ALL METHODS FAILED — ${elementDesc}` });
-      logDiagnostic('click', `❌ ALL click methods FAILED: ${elementDesc} — ${fallbackErr.message}`);
-    }
+    // Debugger threw — ABORT to protect account
+    console.error(`[FoxiExt-CLICK] [${clickTs}] Debugger THREW: ${err.message}. ABORTING click!`);
+    sendMessage({ type: 'STATUS_UPDATE', status: `🖱️ [${clickTs}] Click ❌ ABORTED — ${elementDesc}` });
+    logDiagnostic('click', `❌ Click ABORTED (Debugger threw): ${elementDesc} — ${err.message}`);
+    throw err;
   }
 }
 
